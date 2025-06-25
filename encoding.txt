@@ -1,0 +1,7 @@
+64 squares*
+4 pawn possibles
+28 rook possibles
+8 knight possibles
+28 bishop possibles
+10 king possibles
+56 queen possibles

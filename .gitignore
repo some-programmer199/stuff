@@ -1,0 +1,10 @@
+/.venv
+/chardet-5.2.0.tar.gz
+/chess-1.11.2.tar.gz
+/lc0
+/matplotlib-3.10.3.tar.gz
+/newdata.pgn.zst
+/pygame-1.9.6.tar.gz
+/stockfish
+/stockfish-windows-x86-64-avx2.zip
+/zstandard-0.23.0.tar.gz
