@@ -250,8 +250,21 @@ def train(model: nn.Module, epochs):
           
           save1(model)
 prep_data()
-
-
+def vrl():
+    bot=chess.engine.SimpleEngine(stockfish_path)
+    for x in range(100):
+        b=chess.Board()
+        limit=chess.engine.Limit(depth=6)
+        root=Bot.node(b,Bot.crunch_board(b),None,None)
+        togo=random.choice([chess.WHITE,chess.BLACK])
+        while not b.is_game_over():
+            if b.turn==togo:
+                move=Bot.MCTSsearch(root,400)
+            else:
+                move=bot.play(b,limit).move()
+            b.push(move)
+        result=b.result()
+        
 def load_model(modelx, filepath="chess_model.pth"):
     """Loads the model weights from the specified file."""
     try:
