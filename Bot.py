@@ -6,11 +6,94 @@ import torch.optim as optim
 import moves
 import math
 import datetime
-from multiprocessing import Pool
+from multiprocessing import Pool, Process, Manager
+import multiprocessing
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-def decision(board:chess.Board):
-    legal_moves=list(board.legal_moves)
-    return random.choice(legal_moves)
+
+# ---------- Inference server (separate process owns GPU) ----------
+def inference_worker(request_queue, device_str):
+    # This function runs in a separate process and imports the model classes
+    # directly from this module (which is safe because the process is spawned).
+    import torch
+    from Bot import azt  # import model class from this module
+    torch.set_num_threads(1)
+    dev = torch.device(device_str)
+    model = azt().to(dev)
+    model.eval()
+    while True:
+        item = request_queue.get()
+        if item is None:
+            break
+        batch_numpy, response_queue = item
+        with torch.no_grad():
+            batch_tensor = torch.from_numpy(batch_numpy).float().to(dev)
+            Ps, Vs, CPs = model.forward(batch_tensor)
+            # move results to CPU numpy
+            Ps_np = Ps.detach().cpu().numpy()
+            Vs_np = Vs.detach().cpu().numpy().reshape(-1)  # shape (N,)
+            CPs_np = CPs.detach().cpu().numpy()
+        response_queue.put((Ps_np, Vs_np, CPs_np))
+    # clean exit
+    return
+
+class InferenceServer:
+    def __init__(self, device_str=None):
+        self.manager = Manager()
+        self.request_queue = self.manager.Queue()
+        self.device_str = device_str or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.process = Process(target=inference_worker, args=(self.request_queue, self.device_str))
+        self.process.daemon = True
+        self.started = False
+    def start(self):
+        if not self.started:
+            self.process.start()
+            self.started = True
+    def stop(self):
+        if self.started:
+            # send sentinel and join
+            self.request_queue.put(None)
+            self.process.join(timeout=5)
+            self.started = False
+    def infer(self, batch_tensor: torch.Tensor, timeout=None):
+        """
+        batch_tensor: torch.Tensor (N,104,8,8) on any device — will be converted to numpy (CPU)
+        returns: Ps_np, Vs_np, CPs_np as numpy arrays
+        """
+        if not self.started:
+            self.start()
+        batch_numpy = batch_tensor.detach().cpu().numpy()
+        response_q = self.manager.Queue()
+        self.request_queue.put((batch_numpy, response_q))
+        result = response_q.get(timeout=timeout)
+        return result
+
+# single global server instance (created lazily)
+_inference_server = None
+def get_inference_server():
+    global _inference_server
+    if _inference_server is None:
+        _inference_server = InferenceServer(device_str=("cuda" if torch.cuda.is_available() else "cpu"))
+        _inference_server.start()
+    return _inference_server
+
+# ---------- existing Bot implementation, modified to use inference server ----------
+class Bot:
+    def __init__(self,simulations=100,num_cores=1):
+        self.simulations=simulations
+        self.num_cores = num_cores
+        # ensure inference server is running when a bot is created
+        get_inference_server()
+    def choose_move(self,board:chess.Board):
+        root=node(board,crunch_board(board),None,None)
+        MCTSsearch(root,self.simulations)
+        best_value=0
+        best_child=None
+        for child in root.children:
+            if child.visits >= best_value:
+                best_child=child
+                best_value=child.visits
+        return best_child.move
+
 def movetoNN(move:chess.Move):
    move=str(move)
    if len(move)==4:
@@ -118,6 +201,7 @@ timestamps=[]
 depths=[]
 batch=[]
 def MCTSsearch(root:node,sim):
+    server = get_inference_server()
     for _ in range(sim):
         n=root
         depth=0
@@ -130,12 +214,15 @@ def MCTSsearch(root:node,sim):
         
         n.extend()
         batch=n.children
+        # create batched input for inference
         batchx=torch.stack([x.tensor.view(104,8,8) for x in batch])
-        Ps,Vs,CPs=model.forward(batchx.to(device))
-        for i, node in enumerate(batch):
-                node.P = Ps[i].tolist()
-                node.value = Vs[i].item()
-                node.Q = node.value
+        # send to inference server (which runs on the GPU)
+        Ps_np, Vs_np, CPs_np = server.infer(batchx, timeout=30)  # returns numpy arrays
+        # assign outputs to children
+        for i, child in enumerate(batch):
+                child.P = Ps_np[i].tolist()
+                child.value = float(Vs_np[i])
+                child.Q = child.value
             
         new_values=[]
         for child in n.children:
@@ -233,6 +320,7 @@ class azt(nn.Module):
             policy_x = policy_x.view(policy_x.size(0),-1)
             policy_x=self.policy_fc1(policy_x)
             policy_output = self.policy_fc2(policy_x)
+            policy_output = nn.functional.softmax(policy_output, dim=1)
             # Value head
             value_x = self.value_conv(x)
             value_x = self.value_bn(value_x)
@@ -271,3 +359,5 @@ def benchmark():
         pass
     for i in range(len(speed)):
      print(f"sim {i+1}, speed {speed[i]}, depth {depths[i]}")
+if __name__ == "__main__":
+    benchmark()
