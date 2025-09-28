@@ -85,14 +85,8 @@ class Bot:
         get_inference_server()
     def choose_move(self,board:chess.Board):
         root=node(board,crunch_board(board),None,None)
-        MCTSsearch(root,self.simulations)
-        best_value=0
-        best_child=None
-        for child in root.children:
-            if child.visits >= best_value:
-                best_child=child
-                best_value=child.visits
-        return best_child.move
+        bestmove, distribution=MCTSsearch(root,self.simulations)
+        return bestmove.move, distribution
 
 def movetoNN(move:chess.Move):
    move=str(move)
@@ -233,11 +227,14 @@ def MCTSsearch(root:node,sim):
         depths.append(depth)
     best_value=0
     best_child=None
+    distribution=[]
     for child in root.children:
+        distribution.append(child.visits)
         if child.visits >= best_value:
             best_child=child
             best_value=child.visits
-    return best_child
+    distribution=[x/sum(distribution) for x in distribution]
+    return best_child,distribution
 piece_to_plane={
         chess.PAWN:0,
         chess.KNIGHT:1,
