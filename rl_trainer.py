@@ -5,24 +5,26 @@ from torch.optim import lr_scheduler as lrs
 def add_bar():
     print('-',end='')
 def play_game(bot1:Bot.Bot,bot2:Bot.Bot):
-    board=chess.Board()
+    root=Bot.node(chess.Board(),Bot.crunch_board(chess.Board()),None,None)
     game_states=[]
     max_moves = 400            # safety cap to avoid infinite runs
     move_count = 0
-    while not board.is_game_over() and move_count < max_moves:
-        if board.turn == chess.WHITE:
+    while not root.board.is_game_over() and move_count < max_moves:
+        if root.board.turn == chess.WHITE:
             print(f"\nMove {move_count+1}: White thinking...", flush=True)
-            move,distr=bot1.choose_move(board)
-        else:
+            move,distr=bot1.choose_move(root)
+        elif root.board.turn == chess.BLACK:
             print(f"\nMove {move_count+1}: Black thinking...", flush=True)
-            move,distr=bot2.choose_move(board)
-        game_states.append((board.copy(),move,distr,0))
+            move,distr=bot2.choose_move(root)
+        else:
+            raise ValueError("Invalid board state: turn must be either WHITE or BLACK.")
+        game_states.append((root.board.copy(),move,distr,0))
         add_bar()
-        board.push(move)
+        root.board.push(move)
         move_count += 1
     if move_count >= max_moves:
         print("\nReached max_moves limit — stopping early.", flush=True)
-    result=board.result()
+    result=root.board.result()
     result=-1 if result=='0-1' else 1 if result=='1-0' else 0
     game_states = [(state, move, distr, result) for state, move, distr, _ in game_states]
     return game_states
@@ -56,6 +58,5 @@ if __name__ == "__main__":
             torch.save(Bot.model.state_dict(), f"bot_model_epoch_{epoch+1}.pth")
             print(f"Model saved at epoch {epoch+1}", flush=True)
     # Lower simulations while debugging so choose_move runs quickly
-    
-    
-  
+
+
