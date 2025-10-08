@@ -252,7 +252,13 @@ class resblock(nn.Module):
         x = self.conv2(x)
         x = self.bn2(x)
         return x + res
-
+class ChessAttention(nn.Module):
+    #not full attention, but only in orthagonal, diagonal, knight moves
+    def __init__(self, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        
+        
 class azt(nn.Module):
     def __init__(self, input_size=104, num_move_categories=1858):
         super(azt, self).__init__()
