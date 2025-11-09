@@ -1,71 +1,70 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
 import chess
 b=chess.Board()
-piece_to_plane = {
-    chess.PAWN: 0,
-    chess.KNIGHT: 1,
-    chess.BISHOP: 2,
-    chess.ROOK: 3,
-    chess.QUEEN: 4,
-    chess.KING: 5,
-}
-plane_to_piece = {v: k for k, v in piece_to_plane.items()}
-
-def crunch_board(boardx: chess.Board,depth=8):
-    tensorend = torch.zeros((0, 8, 8), dtype=torch.float32)
-    for x in range(depth):
-        tensor = torch.zeros(13, 8, 8)
-        for square in chess.SQUARES:
-            piece = boardx.piece_at(square)
-            if piece:
-                row = 7 - chess.square_rank(square)
-                col = chess.square_file(square)
-                base = 0 if piece.color == chess.WHITE else 6
-                plane = base + piece_to_plane[piece.piece_type]
-                tensor[plane, row, col] = 1.0
-        tensor[12, :, :] = float(boardx.ply())
-        tensorend = torch.cat((tensorend, tensor), dim=0)
-        try:
-            boardx.pop()
-        except IndexError:
-            pass
-    return tensorend.view(size=(1, 13*depth, 8, 8))
-
+class Node:
+    def __init__(self,board:chess.Board,context):
+        self.board=board
+        self.board_tensor=self._tens()
+        self.context=context
+    def _tens(self):
+        tens=torch.zeros((32,4),dtype=torch.float32)
+        i=0
+        for square,piece in self.board.piece_map().items():
+            piece_type=piece.piece_type-1
+            color=int(piece.color)
+            tens[i,0]=piece_type
+            tens[i,1]=color
+            tens[i,2]=square//8-3.5
+            tens[i,3]=square%8-3.5
+            i+=1
+        return tens
+def search
+#input is shape batch,32,4
+class ResBlock(nn.Module):
+    def __init__(self,dim):
+        super().__init__()
+        self.attn=nn.MultiheadAttention(embed_dim=dim, num_heads=4, dropout=0.1, batch_first=True)
+        self.fc=nn.Sequential(
+            nn.Linear(256,256),
+            nn.ReLU(),
+            nn.Linear(256,256)
+        )
+    def forward(self,x):
+        #x is batch 32 4
+        batch_size=x.shape[0]
+        attn_out,_=self.attn(x,x,x)
+        attn_out=self.fc(attn_out.reshape(batch_size,256)).reshape(x.shape)
+        x=x+attn_out
+        return x
+            
 class chess_attention(nn.Module):
     def __init__(self, num_heads=4, dropout=0.1,encoder_dim=16):
         super().__init__()
         self.num_heads = num_heads
-        self.encoder = nn.Sequential(
-            nn.Linear(66, 64),
-            nn.ReLU(),
-            nn.Linear(64, encoder_dim)
+        self.encoder=nn.Linear(4, encoder_dim)
+        self.attention = nn.MultiheadAttention(embed_dim=encoder_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.resblocks=nn.Sequential(
+            *[ResBlock(encoder_dim) for _ in range(4)]
         )
-        self.attention = nn.MultiheadAttention(embed_dim=encoder_dim, num_heads=num_heads, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
-    def forward(self,board_tensor):
-        board_tensor = board_tensor.view(board_tensor.size(0), -1,13,64) #shape (batch_size, depth, 13, 64)
-        encoded=torch.zeros(board_tensor.size(0),board_tensor.size(1),13,16)
-        for depth in range(board_tensor.size(1)):
-            for board in range(board_tensor.size(2)):
-                if board < 12:
-                    d=board_tensor[depth,board,:,:][0].repeat(16)
-                    
-                else:
-                    d=board_tensor[:,depth,board,:] #d shape (batch_size, 64)
-                    piece=board
-                    d=torch.cat(d,torch.tensor([piece],dtype=torch.float32),depth,dim=1)
-                    
-                print(d.shape)
-                print(encoded.shape)
-                encoded[:,depth,board,:]=d
-        #encoded shape (batch_size, depth, 13, encoder_dim)
-        encoded=self.attention(encoded,encoded,encoded)[0]
-        encoded=self.dropout(encoded)
-        return encoded
-
+        self.outputfc=nn.Sequential(
+            nn.Linear(256,256),
+            nn.ReLU(),
+            nn.Linear(256,4)
+        )
+        
+    def forward(self,x):
+        batch_size=x.shape[0]
+        assert x.shape[1]==32 
+        assert x.shape[2]==4
+        x=self.encoder(x.reshape(batch_size*32,4)).reshape(batch_size,32,16)#batch,seq,dim
+        x,_ = self.attention(x, x, x)
+        x=self.resblocks(x)
+        x=self.outputfc(x.reshape(batch_size,256))
+        return x #batch,4
 
 
 if __name__ == "__main__":
