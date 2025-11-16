@@ -1,75 +1,17 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import chess
-
+from Search import *
+from moves import pmoves
 # Configuration
-CONTEXT_LENGTH = 4096  # total context vector size
+CONTEXT_LENGTH = 256*32  # total context vector size
 CTX_TOKENS = 32         # number of context tokens (CTX_TOKENS * encoder_dim == CONTEXT_LENGTH)
-MAX_PIECES = 32         # number of piece slots in board encoding
-ENCODER_DIM = 128       # per-token embedding dim (must satisfy CTX_TOKENS * ENCODER_DIM == CONTEXT_LENGTH)
+MAX_PIECES = 33        # number of piece slots in board encoding
+ENCODER_DIM = 256       # per-token embedding dim (must satisfy CTX_TOKENS * ENCODER_DIM == CONTEXT_LENGTH)
 
 assert CTX_TOKENS * ENCODER_DIM == CONTEXT_LENGTH, "CTX_TOKENS * ENCODER_DIM must equal CONTEXT_LENGTH"
 
-# ---- Node helper (restores your Node bits) ----
-class Node:
-    """
-    Lightweight container for a chess.Board and its context vector.
-
-    - board: chess.Board
-    - board_tensor: (MAX_PIECES, 4) float tensor
-    - context: (CONTEXT_LENGTH,) float tensor
-    """
-    def __init__(self, board: chess.Board, context: torch.Tensor = None, ctx_len: int = CONTEXT_LENGTH):
-        self.board = board
-        self.board_tensor = self._to_tensor()
-        if context is None:
-            self.context = torch.zeros(ctx_len, dtype=torch.float32)
-        else:
-            self.context = context.clone().detach().to(dtype=torch.float32)
-
-    def _to_tensor(self) -> torch.Tensor:
-        """
-        Encode pieces into a fixed (MAX_PIECES, 4) tensor:
-          col 0: piece_type (0..5) or 0 for empty
-          col 1: color (0 or 1) or 0
-          col 2: rank centered (-3.5..3.5)
-          col 3: file centered (-3.5..3.5)
-        Remaining rows are zeros.
-        """
-        tens = torch.zeros((MAX_PIECES, 4), dtype=torch.float32)
-        i = 0
-        for square, piece in self.board.piece_map().items():
-            if i >= MAX_PIECES:
-                break
-            piece_type = float(piece.piece_type - 1)  # 0..5
-            color = float(int(piece.color))           # 0 or 1
-            rank = float(square // 8) - 3.5
-            file = float(square % 8) - 3.5
-            tens[i, 0] = piece_type
-            tens[i, 1] = color
-            tens[i, 2] = rank
-            tens[i, 3] = file
-            i += 1
-        return tens
-
-    def to_device(self, device):
-        self.board_tensor = self.board_tensor.to(device)
-        self.context = self.context.to(device)
-        return self
-
-def nodes_to_batch(nodes, device=None, dtype=torch.float32):
-    """
-    Convert a list of Node -> (x, context) ready for model.forward:
-      x: (B, MAX_PIECES, 4)
-      context: (B, CONTEXT_LENGTH)
-    """
-    B = len(nodes)
-    x = torch.stack([n.board_tensor for n in nodes], dim=0).to(dtype=dtype)
-    ctx = torch.stack([n.context for n in nodes], dim=0).to(dtype=dtype)
-    if device is not None:
-        x = x.to(device)
-        ctx = ctx.to(device)
-    return x, ctx
 
 # ---- Small cross-attention updater (low param) ----
 class SmallCrossAttnUpdater(nn.Module):
@@ -170,9 +112,14 @@ class ChessAttention(nn.Module):
         )
         # example prediction head (optional)
         self.pred_head = nn.Sequential(
-            nn.Linear(encoder_dim, 64),
+            nn.Linear(encoder_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, 4)
+            nn.Linear(128, 4)
+        )
+        self.policy_head = nn.Sequential(
+            nn.Linear(encoder_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, len(pmoves))
         )
         self.context_updater = SmallCrossAttnUpdater(ctx_dim=context_length,
                                                      new_dim=new_dim,
@@ -191,7 +138,6 @@ class ChessAttention(nn.Module):
         dtype = x.dtype
         if context is None:
             context = torch.zeros(B, CONTEXT_LENGTH, device=device, dtype=dtype)
-
         assert x.shape[1] == MAX_PIECES and x.shape[2] == 4
 
         # encode piece tokens
@@ -215,19 +161,29 @@ class ChessAttention(nn.Module):
 
         # optional prediction
         pred = self.pred_head(pooled)
-
-        return pred, updated_ctx, attn_w
-
+        pred=pred[0].tolist()
+        value=pred[0]
+        antivalue=pred[2]
+        policy=self.policy_head(pooled)
+        return value, antivalue, policy.tolist(), updated_ctx, attn_w
+def evaluator(node:Node):
+    x= node.board_tensor.unsqueeze(0)  # (1, MAX_PIECES, 4)
+    context= node.context.unsqueeze(0)  # (1, CONTEXT_LENGTH)
+    value, antivalue, policy, updated_ctx, attn_w = model(x, context)
+    return value, antivalue, policy[0], updated_ctx.squeeze(0)
+    
 # ---- Example usage ----
 if __name__ == "__main__":
-    # Build two sample Nodes from fresh boards
-    nodes = [Node(chess.Board()), Node(chess.Board())]
-    x_batch, ctx_batch = nodes_to_batch(nodes)  # (B,32,4), (B,1024)
+    
 
     model = ChessAttention()
-    pred, updated_ctx, attn_w = model(x_batch, ctx_batch)
-
-    print("pred.shape:", pred.shape)
-    print("updated_ctx.shape:", updated_ctx.shape)
-    print("attn_w.shape:", attn_w.shape)
+    
     print("Total params:", sum(p.numel() for p in model.parameters()))
+    mcts=MCTS(evaluator)
+    import datetime
+    start=datetime.datetime.now()
+    board=chess.Board()
+    node=Node(board, move=None)
+    best_move=mcts.search(node)
+    print("Best move:", best_move)
+    
