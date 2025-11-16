@@ -1,4 +1,5 @@
 import chess
+import datetime
 pmoves=[
     "a1b1",  "a1c1",  "a1d1",  "a1e1",  "a1f1",  "a1g1",  "a1h1",  "a1a2",
     "a1b2",  "a1c2",  "a1a3",  "a1b3",  "a1c3",  "a1a4",  "a1d4",  "a1a5",
@@ -233,27 +234,19 @@ pmoves=[
     "f7g8q", "f7g8r", "f7g8b", "g7f8q", "g7f8r", "g7f8b", "g7g8q", "g7g8r",
     "g7g8b", "g7h8q", "g7h8r", "g7h8b", "h7g8q", "h7g8r", "h7g8b", "h7h8q",
     "h7h8r", "h7h8b"]
-sq_idx = {}
-prev_fsq = None
-prev_idx = None
+# Build a fast lookup table at import time
+pmove_to_idx = {uci: i for i, uci in enumerate(pmoves)}
 
-for i, move in enumerate(pmoves):
-    if len(move) == 4:
-        fsq = move[:2]
-        if fsq not in sq_idx:
-            if prev_fsq is not None:
-                # Set the end index for the previous square as a tuple
-                start, _ = sq_idx[prev_fsq]
-                sq_idx[prev_fsq] = (start, i)
-            sq_idx[fsq] = (i, None)
-            prev_fsq = fsq
-            prev_idx = i
-    else:
-        # Handle promotions or special moves if needed
-        if "promotion" not in sq_idx:
-            sq_idx["promotion"] = (i, len(pmoves))
+def move_to_idx(move: chess.Move) -> int:
+    """Fast conversion of a chess.Move to its pmoves[] index."""
+    return pmove_to_idx.get(move.uci(), -1)  # returns -1 if not found
+if __name__ == "__main__":
+    import chess
+    # Example usage
+    start=datetime.datetime.now()
+    move = chess.Move.from_uci("e2e4")
+    index = move_to_idx(move)
+    print(f"The index of move {move.uci()} is {index}.")
+    end=datetime.datetime.now()
+    print("Time taken:", (end-start).microseconds)
 
-# Set the end index for the last square as a tuple
-if prev_fsq is not None and sq_idx[prev_fsq][1] is None:
-    start, _ = sq_idx[prev_fsq]
-    sq_idx[prev_fsq] = (start, len(pmoves))
