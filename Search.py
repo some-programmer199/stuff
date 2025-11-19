@@ -43,7 +43,7 @@ class Node:
             tens[i, 3] = file
             i += 1
          
-        tens[MAX_PIECES-1,:]=torch.tensor(float(self.board.ply()), dtype=torch.float32).repeat(4)
+        tens[MAX_PIECES-1,:]=torch.tensor(float(self.board.ply()), dtype=torch.float32).repeat(3)
         return tens
     
 
@@ -101,8 +101,8 @@ class MCTSNode:
             self.W = 0.0
             self.antiW = 0.0
             return
-        Qs = torch.tensor([ch.Q for ch in children], dtype=torch.float32)
-        antiQs = torch.tensor([ch.antiQ for ch in children], dtype=torch.float32)
+        Qs = torch.tensor([ch.Q for ch in children if ch.is_expanded], dtype=torch.float32)
+        antiQs = torch.tensor([ch.antiQ for ch in children if ch.is_expanded], dtype=torch.float32)
         N = sum(ch.N for ch in children)
         W = sum(ch.W for ch in children)
         antiW = sum(ch.antiW for ch in children)
@@ -251,9 +251,12 @@ class MCTS:
             leaf, path = self._select(root)
             policy, value, antivalue, _ = self._evaluate_and_expand(leaf)
             self._backup(path, value, antivalue)
-        best_child = max(root.children.values(), key=lambda ch: ch.N, default=None)
+        distr = {}
+        for child in root.children.values():
+            distr[child.move]=child.Q
+        best_child = max(root.children.values(), key=lambda ch: ch.Q, default=None)
         best_move = best_child.move if best_child else None
-        return best_child, best_move
+        return best_child, best_move,distr
 
 
 def nodes_to_batch(nodes, device=None, dtype=torch.float32):
