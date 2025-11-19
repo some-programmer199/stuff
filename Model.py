@@ -161,11 +161,11 @@ class ChessAttention(nn.Module):
 
         # optional prediction
         pred = self.pred_head(pooled)
-        pred=pred[0].tolist()
-        value=pred[0]
-        antivalue=pred[2]
-        variance=torch.exp(pred[1])
-        antivariance=torch.exp(pred[3])
+        pred=pred[0]
+        value=torch.tanh(pred[0]).item()
+        antivalue=torch.tanh(pred[2]).item()
+        variance=torch.exp(pred[1]).item()
+        antivariance=torch.exp(pred[3]).item()
         policy=self.policy_head(pooled)
         return value, antivalue,variance,antivariance, policy.tolist(), updated_ctx
 def evaluator(node:Node):
@@ -175,7 +175,7 @@ def evaluator(node:Node):
     return value, antivalue, policy[0], variance,antivariance, updated_ctx.squeeze(0)
     
 # ---- Example usage ----
-if __name__ == "__main__":
+if True:
     
 
     model = ChessAttention()
