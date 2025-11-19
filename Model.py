@@ -184,6 +184,6 @@ if __name__ == "__main__":
     start=datetime.datetime.now()
     board=chess.Board()
     node=Node(board, move=None)
-    best_move=mcts.search(node)
+    best_child,best_move,_=mcts.search(node)
     print("Best move:", best_move)
     
