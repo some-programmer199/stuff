@@ -68,6 +68,8 @@ class MCTSNode:
         self.N = 0
         self.W = 0.0
         self.antiW = 0.0
+        self.variance = 1.0
+        self.antivariance = 1.0
         self.Q = 0.0
         self.antiQ = 0.0
         self.is_expanded = False
@@ -100,20 +102,43 @@ class MCTSNode:
             self.N = 0
             self.W = 0.0
             self.antiW = 0.0
+            self.variance = 1.0
+            self.antivariance = 1.0
             return
-        Qs = torch.tensor([ch.Q for ch in children if ch.is_expanded], dtype=torch.float32)
-        antiQs = torch.tensor([ch.antiQ for ch in children if ch.is_expanded], dtype=torch.float32)
-        N = sum(ch.N for ch in children)
-        W = sum(ch.W for ch in children)
-        antiW = sum(ch.antiW for ch in children)
-        # Softmax weights
-        antiQ_weights = softmax(antiQs)
-        Q_weights = softmax(Qs)
+        # Only consider already-expanded children for Q aggregation
+        exp_children = [ch for ch in children if ch.is_expanded]
+        if not exp_children:
+            # fallback if none expanded yet
+            self.Q = 0.0
+            self.antiQ = 0.0
+            self.N = sum(ch.N for ch in children)
+            self.W = sum(ch.W for ch in children)
+            self.antiW = sum(ch.antiW for ch in children)
+            self.variance = 1.0
+            self.antivariance = 1.0
+            return
+
+        Qs = torch.tensor([ch.Q for ch in exp_children], dtype=torch.float32)
+        antiQs = torch.tensor([ch.antiQ for ch in exp_children], dtype=torch.float32)
+        vars = torch.tensor([max(ch.variance, 1e-9) for ch in exp_children], dtype=torch.float32)
+        antivars = torch.tensor([max(ch.antivariance, 1e-9) for ch in exp_children], dtype=torch.float32)
+
+        # Weight by confidence: antiQ weights scale Q aggregation, Q weights scale antiQ aggregation.
+        antiQ_weights = softmax(antiQs / antivars)
+        Q_weights = softmax(Qs / vars)
+
+        # Weighted means
         self.Q = float((antiQ_weights * Qs).sum())
         self.antiQ = float((Q_weights * antiQs).sum())
-        self.N = N
-        self.W = W
-        self.antiW = antiW
+
+        # Propagate uncertainty: variance = E[(value - mean)^2] + expected_child_variance
+        self.variance = float((antiQ_weights * ((Qs - self.Q) ** 2 + vars)).sum())
+        self.antivariance = float((Q_weights * ((antiQs - self.antiQ) ** 2 + antivars)).sum())
+
+        # Tally counts and wins
+        self.N = sum(ch.N for ch in children)
+        self.W = sum(ch.W for ch in children)
+        self.antiW = sum(ch.antiW for ch in children)
 
 # ---- MCTS engine ----
 class MCTS:
@@ -133,28 +158,54 @@ class MCTS:
     def _default_evaluate(self, node: Node):
         legal = list(node.board.legal_moves)
         pol = {m.uci(): 1.0 / max(1, len(legal)) for m in legal}
-        return pol, 0.0, 0.0, node.context
+        value = 0.0
+        antivalue = 0.0
+        variance = 1.0  # Default uncertainty for value
+        antivariance = 1.0  # Default uncertainty for antivalue
+        return pol, value, antivalue, variance, antivariance, node.context
 
     def _select(self, root: MCTSNode):
         path = [root]
         node = root
+        root_turn = root.state.board.turn
         while node.is_expanded and node.children:
             parent_N = max(1, node.N)
             best_score = -float('inf')
             best_child = None
+            # Keep children in a stable list order
             children = list(node.children.values())
-            antiQs = torch.tensor([ch.antiQ for ch in children], dtype=torch.float32)
-            antiQ_weights = softmax(antiQs)
-            for i, (m, ch) in enumerate(node.children.items()):
-                U = self.c_puct * ch.prior * math.sqrt(parent_N) / (1 + ch.N)
-                Q = ch.Q * float(antiQ_weights[i])
+
+            # Build value list for selection from the root's perspective.
+            # Swap Q/antiQ for opponent nodes and incorporate variance/antivariance
+            vals = []
+            vars_for_weights = []
+            for ch in children:
+                same_turn = (ch.state.board.turn == root_turn)
+                val = ch.Q if same_turn else ch.antiQ
+                var = ch.variance if same_turn else ch.antivariance
+                vals.append(val)
+                # avoid divide-by-zero for softmax input scaling
+                vars_for_weights.append(max(var, 1e-9))
+
+            vals_tensor = torch.tensor(vals, dtype=torch.float32)
+            inv_var = torch.tensor([1.0 / v for v in vars_for_weights], dtype=torch.float32)
+            weight_inputs = vals_tensor * inv_var
+            q_weights = softmax(weight_inputs)
+
+            for i, ch in enumerate(children):
+                same_turn = (ch.state.board.turn == root_turn)
+                # exploration scaled by the variance appropriate to the child
+                var_for_U = ch.variance if same_turn else ch.antivariance
+                U = self.c_puct * ch.prior * math.sqrt(parent_N) / (1 + ch.N) * max(var_for_U, 1e-9)
+                q_val = ch.Q if same_turn else ch.antiQ
+                Q = q_val * float(q_weights[i])
                 score = Q + U
                 if score > best_score:
                     best_score = score
                     best_child = ch
             node = best_child
             path.append(node)
-            if node.state.board.is_game_over():
+            if node is None or node.state.board.is_game_over():
                 break
         return node, path
 
@@ -162,10 +213,12 @@ class MCTS:
         # Propagate value and antivalue up the path
         for i, node in enumerate(reversed(path)):
             if i == 0:
-                # Leaf node: set W/antiW directly
+                # Leaf node: set W/antiW directly and mark certainty at leaf
                 node.W = value
                 node.antiW = antivalue
                 node.N = 1
+                node.variance = 0.0
+                node.antivariance = 0.0
             else:
                 node.update_Q()
 
@@ -180,40 +233,45 @@ class MCTS:
             else:
                 value = 0.0
                 antivalue = 0.0
+                variance = 0.0
+                antivariance = 0.0
                 policy = {}
-                return policy, value, antivalue, mnode.state.context
+                return policy, value, antivalue, variance, antivariance, mnode.state.context
             value = 1.0 if winner == board.turn else -1.0
             antivalue = -value
-            return {}, value, antivalue, mnode.state.context
+            variance = 0.0
+            antivariance = 0.0
+            return {}, value, antivalue, variance, antivariance, mnode.state.context
 
         if self.evaluator is None:
-            policy, value, antivalue, new_ctx = self._default_evaluate(mnode.state)
+            policy, value, antivalue, variance, antivariance, new_ctx = self._default_evaluate(mnode.state)
         else:
             res = self.evaluator(mnode.state)
             if res is None:
-                policy, value, antivalue, new_ctx = self._default_evaluate(mnode.state)
+                policy, value, antivalue, variance, antivariance, new_ctx = self._default_evaluate(mnode.state)
             else:
                 # Unpack model output
-                value, antivalue, raw_policy, new_ctx = res
-                # Map raw_policy (list/array of logits) to legal moves
+                value, antivalue, raw_policy, variance, antivariance, new_ctx = res
                 legal_moves = list(board.legal_moves)
                 policy = {}
-                # Softmax over only legal moves
                 import torch
                 logits = torch.tensor([raw_policy[moves.pmove_to_idx[m.uci()]] if m.uci() in moves.pmove_to_idx else float('-inf') for m in legal_moves], dtype=torch.float32)
-                # Mask illegal moves (set to -inf)
                 mask = torch.tensor([m.uci() in moves.pmove_to_idx for m in legal_moves], dtype=torch.bool)
                 logits[~mask] = float('-inf')
                 probs = torch.softmax(logits, dim=0)
                 for i, m in enumerate(legal_moves):
                     if mask[i]:
                         policy[m.uci()] = float(probs[i])
-                # If all probs are zero (shouldn't happen), fallback to uniform
                 if not policy or sum(policy.values()) == 0.0:
                     policy = {m.uci(): 1.0 / len(legal_moves) for m in legal_moves}
 
         mnode.expand(policy)
-        return policy, float(value), float(antivalue), new_ctx
+        mnode.Q = float(value)
+        mnode.antiQ = float(antivalue)
+        mnode.variance = float(variance)
+        mnode.antivariance = float(antivariance)
+        mnode.is_expanded = True
+        return policy, float(value), float(antivalue), float(variance), float(antivariance), new_ctx
 
     def search(self, root_state: Node, num_sims: int = 100):
         root = MCTSNode(root_state, parent=None, prior=1.0)
