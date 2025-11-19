@@ -164,13 +164,15 @@ class ChessAttention(nn.Module):
         pred=pred[0].tolist()
         value=pred[0]
         antivalue=pred[2]
+        variance=torch.exp(pred[1])
+        antivariance=torch.exp(pred[3])
         policy=self.policy_head(pooled)
-        return value, antivalue, policy.tolist(), updated_ctx, attn_w
+        return value, antivalue,variance,antivariance, policy.tolist(), updated_ctx
 def evaluator(node:Node):
     x= node.board_tensor.unsqueeze(0)  # (1, MAX_PIECES, 4)
     context= node.context.unsqueeze(0)  # (1, CONTEXT_LENGTH)
-    value, antivalue, policy, updated_ctx, attn_w = model(x, context)
-    return value, antivalue, policy[0], updated_ctx.squeeze(0)
+    value, antivalue,variance,antivariance, policy, updated_ctx = model(x, context)
+    return value, antivalue, policy[0], variance,antivariance, updated_ctx.squeeze(0)
     
 # ---- Example usage ----
 if __name__ == "__main__":
