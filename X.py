@@ -56,9 +56,11 @@ def _worker_eval(task):
                 else:
                     logits.append(float('-inf'))
             if logits:
-                probs = torch.softmax(torch.tensor(logits, dtype=torch.float32), dim=0)
-                for m, p in zip(legal_moves, probs.tolist()):
-                    policy[m.uci()] = float(p)
+                _logits = _torch.tensor(logits, dtype=_torch.float32)
+                if _torch.isfinite(_logits).any():
+                    probs = _torch.softmax(_logits, dim=0)
+                    for m, p in zip(legal_moves, probs.tolist()):
+                        policy[m.uci()] = float(p)
 
         if not policy and legal_moves:
             policy = {m.uci(): 1.0 / len(legal_moves) for m in legal_moves}
@@ -71,12 +73,9 @@ def _worker_eval(task):
 # ========================================
 # Constants (fallback if Model.py not present)
 # ========================================
-try:
-    from Model import CONTEXT_LENGTH, MAX_PIECES
-except Exception:
-    print("Model.py not found → using defaults")
-    CONTEXT_LENGTH = 256 * 32
-    MAX_PIECES = 33
+
+CONTEXT_LENGTH = 256 * 32
+MAX_PIECES = 33
 
 
 # ========================================
@@ -86,7 +85,22 @@ class Node:
     def __init__(self, board: chess.Board, context: Optional[torch.Tensor] = None):
         self.board = board
         self.board_tensor = self._to_tensor()
-        self.context = context.clone().detach() if context is not None else torch.zeros(CONTEXT_LENGTH, dtype=torch.float32)
+        # robustly handle context whether it's torch.Tensor, numpy or None
+        if context is None:
+            self.context = torch.zeros(CONTEXT_LENGTH, dtype=torch.float32)
+        else:
+            if isinstance(context, torch.Tensor):
+                self.context = context.clone().detach().float()
+            else:
+                import numpy as _np
+                arr = _np.asarray(context, dtype=_np.float32).flatten()
+                if arr.size < CONTEXT_LENGTH:
+                    tmp = _np.zeros(CONTEXT_LENGTH, dtype=_np.float32)
+                    tmp[:arr.size] = arr
+                    arr = tmp
+                else:
+                    arr = arr[:CONTEXT_LENGTH]
+                self.context = torch.from_numpy(arr).float()
 
     def _to_tensor(self) -> torch.Tensor:
         tens = torch.zeros((MAX_PIECES, 4), dtype=torch.float32)
@@ -95,12 +109,13 @@ class Node:
             if i >= MAX_PIECES - 1:
                 break
             tens[i, 0] = piece.piece_type - 1
-            tens[i, 1] = int(piece.color)
+            tens[i, 1] = float(int(piece.color))
             tens[i, 2] = (square // 8) - 3.5
             tens[i, 3] = (square % 8) - 3.5
             i += 1
-        tens[MAX_PIECES-1, 0] = 10
-        tens[MAX_PIECES-1, 1:] = self.board.ply()
+        # sentinel row: keep ply in a single slot instead of a 3-element slice
+        tens[MAX_PIECES-1, 0] = 10.0
+        tens[MAX_PIECES-1, 1] = float(self.board.ply())
         return tens
 
     def to(self, device):
@@ -127,7 +142,6 @@ class MCTSNode:
         self.Q = 0.0
         self.antiQ = 0.0
         self.variance = 1.0
-        self.antivariance = 1.0
 
         self.virtual_loss = 0
         self.is_expanded = False
@@ -145,19 +159,16 @@ class MCTSNode:
 
         children = list(self.children.values())
         opponent_vals = []
-        opponent_vars = []
+        vars=[]
         for ch in children:
             if ch.turn == root_turn:  # opponent to move at child
                 opponent_vals.append(ch.antiQ)
-                opponent_vars.append(max(ch.antivariance, 1e-8))
             else:
                 opponent_vals.append(ch.Q)
-                opponent_vars.append(max(ch.variance, 1e-8))
-
+            vars.append(ch.variance)
         vals = torch.tensor(opponent_vals, dtype=torch.float32)
-        vars_t = torch.tensor(opponent_vars, dtype=torch.float32)
-        weighted = vals / vars_t
-        weights = torch.softmax(weighted, dim=0)
+        vars_t = torch.tensor(vars, dtype=torch.float32)
+        weights = torch.softmax(vals, dim=0)
         self.opponent_softmax_weights = weights
 
 
@@ -166,7 +177,7 @@ class MCTSNode:
 # ========================================
 class MCTS:
     def __init__(self, evaluator=None, c_puct: float = 2.5, dirichlet_alpha: float = 0.3,
-                 dirichlet_epsilon: float = 0.25, batch_size: int = 16, num_workers: int = 8):
+                 dirichlet_epsilon: float = 0.25, batch_size: int = 16, num_workers: int = 4):
         self.evaluator = evaluator
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
@@ -187,9 +198,10 @@ class MCTS:
                     initializer=_worker_init,
                     initargs=(blob,)
                 )
-            except:
+            except Exception as e:
+                print("Process pool creation failed:", e)
                 print("Warning: Could not create process pool — falling back to threads")
-
+        
     def _default_eval(self, node: Node) -> Tuple[dict, float, float, float, float, torch.Tensor]:
         legal = list(node.board.legal_moves)
         n = max(1, len(legal))
@@ -272,7 +284,7 @@ class MCTS:
                 exploitation = float(weights[i]) * exploit_val
 
                 # exploration: scaled by our own uncertainty
-                var_expl = child.variance if child.turn == root_turn else child.antivariance
+                var_expl = child.variance
                 u = self.c_puct * child.prior * math.sqrt(parent_N) / (1 + child.N + child.virtual_loss)
                 u *= math.sqrt(var_expl)  # or just * var_expl — your choice
 
@@ -308,7 +320,6 @@ class MCTS:
 
         leaf.is_expanded = True
         leaf.variance = float(var)
-        leaf.antivariance = float(avar)
 
         # initial backup values
         leaf.W = v
@@ -317,11 +328,11 @@ class MCTS:
         leaf.Q = v
         leaf.antiQ = av
 
-    def _backup(self, path: List[MCTSNode], value: float, antivalue: float):
+    def _backup(self, path: List[MCTSNode], value: float, antivalue: float,variance:float):
         for node in reversed(path):
             node.N += 1
             node.W += value
-            node.W_anti += antivalue
+            node.W_anti += antivalue*0.99+0.01*node.prior
             node.virtual_loss = max(0, node.virtual_loss - 3)
             node.recompute_stats_and_weights(path[0].turn)
 
@@ -350,7 +361,7 @@ class MCTS:
             root.children[uci] = child
         root.is_expanded = True
 
-        for _ in tqdm.tqdm(range(num_sims), desc="MCTS sims"):
+        for _ in tqdm.tqdm(range(num_sims), desc="MCTS sims",colour='#ff0000'):
             leaf, path = self._select(root)
             if not leaf.is_expanded:
                 self._expand(leaf)
@@ -360,15 +371,15 @@ class MCTS:
                 # already expanded (rare race), just reuse
                 value = leaf.Q
                 antivalue = leaf.antiQ
-
-            self._backup(path, value, antivalue)
+            variance=leaf.variance
+            self._backup(path, value, antivalue, variance)
 
         visits = {uci: child.N for uci, child in root.children.items()}
         best_uci = max(visits, key=visits.get)
         best_child = root.children[best_uci]
 
         return best_uci, visits, best_child
-
+    def mp_search
     def close(self):
         for pool in (self._thread_pool, self._process_pool):
             if pool:
@@ -378,10 +389,14 @@ class MCTS:
 # ========================================
 # Quick test (uncomment to run)
 # ========================================
+from Model import evaluator, ChessAttention
 if __name__ == "__main__":
+    model=ChessAttention()
+    def evaluator_fn(node:Node):
+        return evaluator(node, model)
     board = chess.Board()
-    mcts = MCTS(evaluator=None, num_sims=400)  # no model → uniform random
-    move, visits, _ = mcts.search(board, num_sims=800)
+    mcts = MCTS(evaluator=evaluator_fn, num_workers=2)  # no model → uniform random
+    move, visits, _ = mcts.search(board, num_sims=200)
     print("Best move:", move)
     print("Visit distribution:", {chess.Move.from_uci(uci).uci(): n for uci, n in visits.items()})
     mcts.close()
