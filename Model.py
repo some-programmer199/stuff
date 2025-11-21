@@ -92,8 +92,8 @@ class ResBlock(nn.Module):
 
 # ---- Full model integrating Node ----
 class ChessAttention(nn.Module):
-    def __init__(self, num_heads=8, dropout=0.1, encoder_dim=ENCODER_DIM,
-                 resblocks=32, ctx_tokens=CTX_TOKENS, context_length=CONTEXT_LENGTH,
+    def __init__(self, num_heads=16, dropout=0.1, encoder_dim=ENCODER_DIM,
+                 resblocks=16, ctx_tokens=CTX_TOKENS, context_length=CONTEXT_LENGTH,
                  new_dim=512):
         super().__init__()
         assert ctx_tokens * encoder_dim == context_length
@@ -168,24 +168,18 @@ class ChessAttention(nn.Module):
         antivariance=torch.exp(pred[3]).item()
         policy=self.policy_head(pooled)
         return value, antivalue,variance,antivariance, policy.tolist(), updated_ctx
-def evaluator(node:Node):
+def evaluator(node:Node,model:ChessAttention):
     x= node.board_tensor.unsqueeze(0)  # (1, MAX_PIECES, 4)
     context= node.context.unsqueeze(0)  # (1, CONTEXT_LENGTH)
     value, antivalue,variance,antivariance, policy, updated_ctx = model(x, context)
     return value, antivalue, policy[0], variance,antivariance, updated_ctx.squeeze(0)
     
 # ---- Example usage ----
-if True:
+if __name__ == "__main__":
     
 
     model = ChessAttention()
     
     print("Total params:", sum(p.numel() for p in model.parameters()))
-    mcts=MCTS(evaluator)
-    import datetime
-    start=datetime.datetime.now()
-    board=chess.Board()
-    node=Node(board, move=None)
-    best_child,best_move,_=mcts.search(node)
-    print("Best move:", best_move)
+   
     
