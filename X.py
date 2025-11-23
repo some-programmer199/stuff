@@ -7,76 +7,63 @@ import tqdm
 import threading
 import pickle
 import time
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
 from typing import Dict, Tuple, Optional, List, Any
-
-# ========================================
-# Worker-side evaluator (for multiprocessing)
-# ========================================
-_worker_evaluator = None
-
-def _worker_init(eval_pickle_bytes):
-    global _worker_evaluator
-    try:
-        _worker_evaluator = pickle.loads(eval_pickle_bytes)
-    except Exception as e:
-        print("Worker init failed:", e)
-        _worker_evaluator = None
-
-def _worker_eval(task):
-    global _worker_evaluator
-    fen, bt_np, ctx_np = task
-    if _worker_evaluator is None:
-        return fen, None
-    try:
-        import torch as _torch
-        node = type('obj', (), {})()
-        node.board_tensor = _torch.from_numpy(bt_np)
-        node.context = _torch.from_numpy(ctx_np)
-        res = _worker_evaluator(node)
-
-        # Expected: (value, antivalue, raw_policy, variance, antivariance, ctx)
-        value, antivalue, raw_policy, variance, antivariance, ctx = res
-
-        # Build legal policy dict
-        import chess as _chess
-        board = _chess.Board(fen)
-        legal_moves = list(board.legal_moves)
-        policy = {}
-
-        if isinstance(raw_policy, dict):
-            legal_uci = {m.uci() for m in legal_moves}
-            policy = {k: float(v) for k, v in raw_policy.items() if k in legal_uci}
-        else:
-            logits = []
-            for m in legal_moves:
-                idx = moves.pmove_to_idx.get(m.uci(), -1)
-                if 0 <= idx < len(raw_policy):
-                    logits.append(raw_policy[idx])
-                else:
-                    logits.append(float('-inf'))
-            if logits:
-                _logits = _torch.tensor(logits, dtype=_torch.float32)
-                if _torch.isfinite(_logits).any():
-                    probs = _torch.softmax(_logits, dim=0)
-                    for m, p in zip(legal_moves, probs.tolist()):
-                        policy[m.uci()] = float(p)
-
-        if not policy and legal_moves:
-            policy = {m.uci(): 1.0 / len(legal_moves) for m in legal_moves}
-
-        return fen, (policy, float(value), float(antivalue), float(variance), float(antivariance), ctx.cpu().numpy() if hasattr(ctx, 'cpu') else ctx)
-    except Exception as e:
-        return fen, None
-
-
-# ========================================
-# Constants (fallback if Model.py not present)
-# ========================================
+import lmdb
+import os
+import numpy as _np
+TEMPERATURE = 10e10
+global avearage_variance
+avearage_variance=1.0
+global ix
+ix=1
+# open a writable LMDB for main process; workers will open their own readonly handle
+LMDB_PATH = './lmdb_data'
+os.makedirs(LMDB_PATH, exist_ok=True)
+env = lmdb.open(LMDB_PATH, map_size=2**30, max_dbs=0)
 
 CONTEXT_LENGTH = 256 * 32
 MAX_PIECES = 33
+def _unpack_ctx(ctx_obj):
+    """
+    Safely unpack a context which may be:
+      - None
+      - pickled bytes / bytearray
+      - a torch.Tensor
+      - already a numpy/other object
+    Returns the raw context object or None.
+    """
+    if ctx_obj is None:
+        return None
+    if isinstance(ctx_obj, (bytes, bytearray)):
+        try:
+            return pickle.loads(ctx_obj)
+        except Exception:
+            return None
+    if isinstance(ctx_obj, torch.Tensor):
+        return ctx_obj
+    try:
+        # best-effort: try to unpickle, otherwise return as-is
+        return pickle.loads(ctx_obj)
+    except Exception:
+        return ctx_obj
+# helper LMDB helpers
+def lmdb_get_node(node_id: int, writable: bool = False) -> Optional[Dict[str, Any]]:
+    path = f'node_{node_id}'.encode()
+    # child processes should open their own env; main process can reuse global env
+    if writable:
+        with env.begin(write=False) as txn:
+            data = txn.get(path)
+    else:
+        # readonly access (safe for workers if they open their own env in their process)
+        with env.begin(write=False) as txn:
+            data = txn.get(path)
+    return pickle.loads(data) if data is not None else None
 
+def lmdb_put_node(node_dict: Dict[str, Any]):
+    key = f"node_{node_dict['id']}".encode()
+    with env.begin(write=True) as txn:
+        txn.put(key, pickle.dumps(node_dict))
 
 # ========================================
 # Node: lightweight board + tensor encoding
@@ -92,7 +79,6 @@ class Node:
             if isinstance(context, torch.Tensor):
                 self.context = context.clone().detach().float()
             else:
-                import numpy as _np
                 arr = _np.asarray(context, dtype=_np.float32).flatten()
                 if arr.size < CONTEXT_LENGTH:
                     tmp = _np.zeros(CONTEXT_LENGTH, dtype=_np.float32)
@@ -122,7 +108,8 @@ class Node:
         self.board_tensor = self.board_tensor.to(device)
         self.context = self.context.to(device)
         return self
-
+global id
+id=0
 
 # ========================================
 # MCTS Node with your beloved variance madness
@@ -134,7 +121,9 @@ class MCTSNode:
         self.move = move_uci
         self.turn = turn
         self.prior = float(prior)
-
+        global id
+        self.id=id
+        id+=1
         self.children: Dict[str, MCTSNode] = {}
         self.N = 0
         self.W = 0.0        # sum of values (from root's perspective)
@@ -147,6 +136,9 @@ class MCTSNode:
         self.is_expanded = False
 
         self.opponent_softmax_weights: Optional[torch.Tensor] = None  # cached for selection
+
+        # persist minimal serializable representation to LMDB
+        lmdb_put_node(self.to_dict())
 
     def recompute_stats_and_weights(self, root_turn: chess.Color):
         if self.N > 0:
@@ -168,9 +160,106 @@ class MCTSNode:
             vars.append(ch.variance)
         vals = torch.tensor(opponent_vals, dtype=torch.float32)
         vars_t = torch.tensor(vars, dtype=torch.float32)
-        weights = torch.softmax(vals, dim=0)
+        weights = torch.softmax(vals/TEMPERATURE, dim=0)
         self.opponent_softmax_weights = weights
 
+    def to_dict(self):
+        # store a compact dict used by workers/processes
+        try:
+            ctx_pickled = pickle.dumps(self.state.context)
+        except Exception:
+            ctx_pickled = None
+        return {
+            'id': self.id,
+            'state': self.state.board.fen(),
+            'move': self.move,
+            'N': self.N,
+            'W': self.W,
+            'W_anti': self.W_anti,
+            'Q': self.Q,
+            'antiQ': self.antiQ,
+            'variance': self.variance,
+            'is_expanded': self.is_expanded,
+            'children': {uci: child.id for uci, child in self.children.items()},
+            'turn': int(bool(self.turn)),
+            'prior': float(self.prior),
+            'virtual_loss': int(self.virtual_loss),
+            'context': ctx_pickled
+        }
+
+
+# remove incomplete helpers and replace with working worker and mp orchestration
+def worker_process(root_id: int, env_path: str, eval_request_queue: multiprocessing.Queue, shutdown_event: multiprocessing.Event):
+    """
+    Worker runs selection only, reading the shared tree from LMDB (readonly).
+    When a leaf is found it places a request on eval_request_queue:
+      (leaf_id, path_ids)
+    The main process will perform evaluation, expansion and backup.
+    """
+    # open readonly env in this process
+    wenv = lmdb.open(env_path, readonly=True, lock=False)
+    def get_node(txn, nid):
+        b = txn.get(f'node_{nid}'.encode())
+        return pickle.loads(b) if b is not None else None
+
+    while not shutdown_event.is_set():
+        try:
+            with wenv.begin() as txn:
+                root_b = txn.get(f'node_{root_id}'.encode())
+                if root_b is None:
+                    time.sleep(0.01)
+                    continue
+                node = pickle.loads(root_b)
+                path = [node['id']]
+                root_turn = node.get('turn', 1)
+                # traverse until leaf
+                while node.get('is_expanded') and node.get('children'):
+                    children_ids = list(node['children'].values())
+                    child_dicts = []
+                    for cid in children_ids:
+                        cd = get_node(txn, cid)
+                        if cd is not None:
+                            child_dicts.append(cd)
+                    if not child_dicts:
+                        break
+                    opponent_vals = []
+                    priors = []
+                    Ns = []
+                    for ch in child_dicts:
+                        if ch.get('turn', 1) == root_turn:
+                            opponent_vals.append(ch.get('antiQ', 0.0))
+                        else:
+                            opponent_vals.append(ch.get('Q', 0.0))
+                        priors.append(ch.get('prior', 0.0))
+                        Ns.append(max(1, ch.get('N', 0)))
+                    vals_t = torch.tensor(opponent_vals, dtype=torch.float32)
+                    weights = torch.softmax(vals_t/TEMPERATURE, dim=0)
+                    parent_N = max(1, sum(max(1, ch.get('N', 0)) for ch in child_dicts))
+                    best_score = -float('inf')
+                    best_idx = 0
+                    for i, ch in enumerate(child_dicts):
+                        exploit_val = ch.get('Q', 0.0) if ch.get('turn', 1) != root_turn else ch.get('antiQ', 0.0)
+                        exploitation = float(weights[i]) * float(exploit_val)
+                        u = 2.5 * float(priors[i]) * math.sqrt(parent_N) / (1 + ch.get('N', 0))*  (1 + ch.get('variance', 1.0))
+                        global avearage_variance
+                        avearage_variance+=u
+                        global ix
+                        ix+=1
+                        score = exploitation + u
+                        if score > best_score:
+                            best_score = score
+                            best_idx = i
+                    node = child_dicts[best_idx]
+                    path.append(node['id'])
+                # leaf found -> request evaluation
+                leaf_id = node['id']
+                # send state fen and pickled context
+                eval_request_queue.put((leaf_id, node['state'], node.get('context'), path))
+        except Exception as e:
+            # avoid noisy trace in worker; short backoff
+            time.sleep(0.01)
+            print("Worker exception:", e)
+            continue
 
 # ========================================
 # The Beast: Optimized MCTS
@@ -186,22 +275,13 @@ class MCTS:
         self.num_workers = max(1, num_workers)
 
         self.eval_cache: Dict[str, Tuple] = {}
-        self.lock = threading.Lock()
+        self.lock = multiprocessing.Lock()  # used when main process updates LMDB stats/backup
 
-        self._thread_pool = ThreadPoolExecutor(max_workers=self.num_workers)
-        self._process_pool = None
-        if evaluator is not None:
-            try:
-                blob = pickle.dumps(evaluator)
-                self._process_pool = ProcessPoolExecutor(
-                    max_workers=self.num_workers,
-                    initializer=_worker_init,
-                    initargs=(blob,)
-                )
-            except Exception as e:
-                print("Process pool creation failed:", e)
-                print("Warning: Could not create process pool — falling back to threads")
-        
+        # worker control
+        self._workers: List[multiprocessing.Process] = []
+        self._eval_request_queue: Optional[multiprocessing.Queue] = None
+        self._shutdown_event: Optional[multiprocessing.Event] = None
+
     def _default_eval(self, node: Node) -> Tuple[dict, float, float, float, float, torch.Tensor]:
         legal = list(node.board.legal_moves)
         n = max(1, len(legal))
@@ -249,7 +329,7 @@ class MCTS:
                             if 0 <= idx < len(pol_raw):
                                 logits[i] = pol_raw[idx]
                         if logits.isfinite().any():
-                            probs = torch.softmax(logits, dim=0)
+                            probs = torch.softmax(logits/TEMPERATURE, dim=0)
                             for m, p in zip(legal, probs.tolist()):
                                 policy[m.uci()] = p
                     if not policy:
@@ -261,82 +341,199 @@ class MCTS:
         self.eval_cache[fen] = res
         return res
 
-    def _select(self, root: MCTSNode) -> Tuple[MCTSNode, List[MCTSNode]]:
-        node = root
-        path = [node]
-        root_turn = root.turn
+    # keep single-process helpers for local use
+    def _expand_and_backup(self, leaf_id: int, policy: dict, v: float, av: float, var: float, ctx_pickled: Any, path: List[int]):
+        """
+        Expand the leaf (create child nodes) and perform backup along the path.
+        This function acquires a lock to serialize LMDB writes.
+        """
+        with self.lock:
+            # reload leaf to ensure latest
+            leaf = lmdb_get_node(leaf_id)
+            if leaf is None:
+                return
+            if not leaf.get('is_expanded'):
+                board = chess.Board(leaf['state'])
+                # build and attach children
+                for uci, p in policy.items():
+                    move = chess.Move.from_uci(uci)
+                    new_board = board.copy(stack=False)
+                    new_board.push(move)
+                    # safely unpack context (ctx_pickled may be bytes or a tensor)
+                    ctx_obj = _unpack_ctx(ctx_pickled)
+                    node_obj = MCTSNode(Node(new_board, ctx_obj),
+                                        parent=None, prior=p, move_uci=uci, turn=not board.turn)
+                    # child persisted by MCTSNode
+                    # link child id in leaf dict
+                    leaf_children = leaf.get('children', {})
+                    leaf_children[uci] = node_obj.id
+                    leaf['children'] = leaf_children
+                leaf['is_expanded'] = True
+                leaf['variance'] = float(var)
+                # initialize leaf stats
+                leaf['W'] = float(v)
+                leaf['W_anti'] = float(av)
+                leaf['N'] = 1
+                leaf['Q'] = float(v)
+                leaf['antiQ'] = float(av)
+                lmdb_put_node(leaf)
 
-        while node.is_expanded and node.children:
-            children = list(node.children.values())
-            if node.opponent_softmax_weights is None:
-                node.recompute_stats_and_weights(root_turn)
+            # backup along the path (path is list of ids from root..leaf)
+            # we assume path contains valid node ids and exist
+            for nid in reversed(path):
+                nd = lmdb_get_node(nid)
+                if nd is None:
+                    continue
+                nd['N'] = nd.get('N', 0) + 1
+                nd['W'] = nd.get('W', 0.0) + v
+                nd['W_anti'] = nd.get('W_anti', 0.0) + (av * 0.99 + 0.01 * nd.get('prior', 0.0))
+                nd['virtual_loss'] = max(0, nd.get('virtual_loss', 0) - 0)
+                # recompute Qs
+                nd['Q'] = nd['W'] / max(1, nd['N'])
+                nd['antiQ'] = nd['W_anti'] / max(1, nd['N'])
+                lmdb_put_node(nd)
 
-            weights = node.opponent_softmax_weights
-            parent_N = max(1, sum(ch.N for ch in children))
+    def mp_search(self, board: chess.Board, num_sims: int = 800, context: Optional[torch.Tensor] = None):
+        """
+        Orchestrate multiprocessing MCTS:
+          - spawn worker processes to run selection from the shared LMDB tree
+          - workers put leaf eval requests on a queue
+          - main process batches evaluations, expands and backs up under a lock
+        """
+        # prepare root
+        root_state = Node(board, context)
+        root = MCTSNode(root_state, None, 1.0, None, board.turn)
 
-            best_score = -float('inf')
-            best_child = None
-            best_idx = -1
+        policy, v, av, var, avar, ctx = self._eval_node(root)
+        # apply dirichlet noise to root policy if requested
+        if self.dirichlet_alpha:
+            moves_list = list(policy.keys())
+            if moves_list:
+                noise = _np.array([random.gammavariate(self.dirichlet_alpha, 1.0) for _ in moves_list], dtype=float)
+                noise = noise / (noise.sum() + 1e-12)
+                policy = {m: policy[m] * (1 - self.dirichlet_epsilon) + float(n) * self.dirichlet_epsilon
+                          for m, n in zip(moves_list, noise)}
 
-            for i, child in enumerate(children):
-                # exploitation: weighted by how much opponent likes this node
-                exploit_val = child.Q if child.turn == root_turn else child.antiQ
-                exploitation = float(weights[i]) * exploit_val
-
-                # exploration: scaled by our own uncertainty
-                var_expl = child.variance
-                u = self.c_puct * child.prior * math.sqrt(parent_N) / (1 + child.N + child.virtual_loss)
-                u *= math.sqrt(var_expl)  # or just * var_expl — your choice
-
-                score = exploitation + u
-                if score > best_score:
-                    best_score = score
-                    best_child = child
-                    best_idx = i
-
-            best_child.virtual_loss += 3  # virtual loss
-            node = best_child
-            path.append(node)
-
-        return node, path
-
-    def _expand(self, leaf: MCTSNode):
-        policy, v, av, var, avar, ctx = self._eval_node(leaf)
-        board = leaf.state.board
-
+        # Expand root locally (persisted by MCTSNode creation)
+        board_copy = root.state.board
         for uci, p in policy.items():
             move = chess.Move.from_uci(uci)
-            new_board = board.copy(stack=False)
+            new_board = board_copy.copy(stack=False)
             new_board.push(move)
             new_node = Node(new_board, ctx)
-            child = MCTSNode(
-                state=new_node,
-                parent=leaf,
-                prior=p,
-                move_uci=uci,
-                turn=not board.turn
-            )
-            leaf.children[uci] = child
+            child = MCTSNode(new_node, root, p, uci, not board_copy.turn)
+            root.children[uci] = child
+        root.is_expanded = True
+        # update root on LMDB (overwrite)
+        lmdb_put_node(root.to_dict())
 
-        leaf.is_expanded = True
-        leaf.variance = float(var)
+        # create queues and workers
+        eval_queue = multiprocessing.Queue(maxsize=1024)
+        shutdown_event = multiprocessing.Event()
+        self._eval_request_queue = eval_queue
+        self._shutdown_event = shutdown_event
 
-        # initial backup values
-        leaf.W = v
-        leaf.W_anti = av
-        leaf.N = 1
-        leaf.Q = v
-        leaf.antiQ = av
+        # spawn worker processes
+        for i in range(self.num_workers):
+            p = multiprocessing.Process(target=worker_process,
+                                        args=(root.id, LMDB_PATH, eval_queue, shutdown_event),
+                                        daemon=True)
+            p.start()
+            self._workers.append(p)
 
-    def _backup(self, path: List[MCTSNode], value: float, antivalue: float,variance:float):
-        for node in reversed(path):
-            node.N += 1
-            node.W += value
-            node.W_anti += antivalue*0.99+0.01*node.prior
-            node.virtual_loss = max(0, node.virtual_loss - 3)
-            node.recompute_stats_and_weights(path[0].turn)
+        sims_done = 0
+        bar = tqdm.tqdm(total=num_sims, desc="MCTS sims (MP)", colour='#00ff00')
+        try:
+            while sims_done < num_sims-1:
+                batch = []
+                try:
+                    # collect up to batch_size requests
+                    while len(batch) < self.batch_size:
+                        item = eval_queue.get(timeout=0.2)
+                        batch.append(item)
+                
+                except Exception:
+                    # timeout or empty; proceed with what we have
+                    pass
+                
+                if not batch:
+                    continue
 
+                # deduplicate by leaf id, keep most recent path
+                unique = {}
+                for leaf_id, fen, ctx_pickled, path in batch:
+                    unique[leaf_id] = (fen, ctx_pickled, path)
+                eval_items = list(unique.items())[:self.batch_size]  # [(leaf_id, (fen, ctx, path))]
+                # prepare Node objects for evaluator
+                eval_nodes = []
+                leaf_ids = []
+                paths = []
+                for leaf_id, (fen, ctx_pickled, path) in eval_items:
+                    board_local = chess.Board(fen)
+                    ctx = _unpack_ctx(ctx_pickled)
+                    node = Node(board_local, ctx)
+                    eval_nodes.append(node)
+                    leaf_ids.append(leaf_id)
+                    paths.append(path)
+
+                # run evaluator in batch (sequential here but could be batched by model)
+                results = []
+                for node in eval_nodes:
+                    if self.evaluator is None:
+                        results.append(self._default_eval(node))
+                    else:
+                        try:
+                            raw = self.evaluator(node)
+                            if raw is None or not isinstance(raw, (tuple, list)) or len(raw) < 6:
+                                results.append(self._default_eval(node))
+                            else:
+                                # evaluator returns (v, av, pol_raw, var, avar, ctx)
+                                v, av, pol_raw, var, avar, ctx = raw
+                                # normalize pol_raw into dict for expansion convenience
+                                if isinstance(pol_raw, dict):
+                                    policy_dict = {k: float(vv) for k, vv in pol_raw.items()}
+                                else:
+                                    # fallback uniform over legal moves
+                                    legal = list(node.board.legal_moves)
+                                    policy_dict = {m.uci(): 1.0/len(legal) for m in legal}
+                                results.append((policy_dict, float(v), float(av), float(var), float(avar), pickle.dumps(ctx)))
+                        except Exception:
+                            results.append(self._default_eval(node))
+
+                # expand and backup each result under lock
+                for i, (leaf_id, (fen, ctx_pickled, path)) in enumerate(eval_items):
+                    policy, v, av, var, avar, ctx_p = results[i]
+                    self._expand_and_backup(leaf_id, policy, v, av, var, ctx_p, path)
+                    sims_done += 1
+                    bar.update(1)
+        finally:
+            bar.close()
+            # shutdown workers
+            shutdown_event.set()
+            for p in self._workers:
+                p.join(timeout=1.0)
+            self._workers = []
+
+        # after sims compute best move from root in LMDB
+        root_dict = lmdb_get_node(root.id)
+        if not root_dict:
+            return None, {}, None
+        visits = {}
+        for uci, cid in root_dict.get('children', {}).items():
+            child = lmdb_get_node(cid)
+            visits[uci] = child.get('N', 0) if child else 0
+        best_uci = max(visits, key=visits.get) if visits else None
+        best_child = None
+        if best_uci:
+            best_child = lmdb_get_node(root_dict['children'][best_uci])
+        return best_uci, visits, best_child
+
+    # keep the legacy single-process search
     def search(self, board: chess.Board, num_sims: int = 800, context: Optional[torch.Tensor] = None):
+        # default to mp_search if evaluator is provided
+        if self.num_workers > 1 and self.evaluator is not None:
+            return self.mp_search(board, num_sims=num_sims, context=context)
+        # else fallback to original single-process search
         root_state = Node(board, context)
         root = MCTSNode(root_state, None, 1.0, None, board.turn)
 
@@ -379,12 +576,19 @@ class MCTS:
         best_child = root.children[best_uci]
 
         return best_uci, visits, best_child
-    def mp_search
-    def close(self):
-        for pool in (self._thread_pool, self._process_pool):
-            if pool:
-                pool.shutdown(wait=True)
 
+    def close(self):
+        # attempt to shut down workers if any
+        if self._shutdown_event:
+            self._shutdown_event.set()
+        for p in self._workers:
+            p.join(timeout=1.0)
+        self._workers = []
+        # close LMDB env if needed
+        try:
+            env.close()
+        except Exception:
+            pass
 
 # ========================================
 # Quick test (uncomment to run)
@@ -392,11 +596,14 @@ class MCTS:
 from Model import evaluator, ChessAttention
 if __name__ == "__main__":
     model=ChessAttention()
+    print("Total params:", sum(p.numel() for p in model.parameters()))
     def evaluator_fn(node:Node):
         return evaluator(node, model)
     board = chess.Board()
-    mcts = MCTS(evaluator=evaluator_fn, num_workers=2)  # no model → uniform random
-    move, visits, _ = mcts.search(board, num_sims=200)
+    mcts = MCTS(evaluator=evaluator_fn, num_workers=3)  # workers -> multiprocessing selection
+    move, visits, _ = mcts.mp_search(board, num_sims=256)
     print("Best move:", move)
     print("Visit distribution:", {chess.Move.from_uci(uci).uci(): n for uci, n in visits.items()})
     mcts.close()
+    print("avearage_variance:", avearage_variance/ix)
+

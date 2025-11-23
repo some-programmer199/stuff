@@ -5,8 +5,8 @@ import chess
 from Search import *
 from moves import pmoves
 # Configuration
-CONTEXT_LENGTH = 256*32  # total context vector size
-CTX_TOKENS = 32         # number of context tokens (CTX_TOKENS * encoder_dim == CONTEXT_LENGTH)
+CONTEXT_LENGTH = 256*4  # total context vector size
+CTX_TOKENS = 4   # number of context tokens (CTX_TOKENS * encoder_dim == CONTEXT_LENGTH)
 MAX_PIECES = 33        # number of piece slots in board encoding
 ENCODER_DIM = 256       # per-token embedding dim (must satisfy CTX_TOKENS * ENCODER_DIM == CONTEXT_LENGTH)
 
@@ -164,7 +164,7 @@ class ChessAttention(nn.Module):
         pred=pred[0]
         value=torch.tanh(pred[0]).item()
         antivalue=torch.tanh(pred[2]).item()
-        variance=torch.exp(pred[1]).item()
+        variance=torch.tanh(pred[1]).item()
         antivariance=torch.exp(pred[3]).item()
         policy=self.policy_head(pooled)
         return value, antivalue,variance,antivariance, policy.tolist(), updated_ctx
@@ -172,7 +172,7 @@ def evaluator(node:Node,model:ChessAttention):
     x= node.board_tensor.unsqueeze(0)  # (1, MAX_PIECES, 4)
     context= node.context.unsqueeze(0)  # (1, CONTEXT_LENGTH)
     value, antivalue,variance,antivariance, policy, updated_ctx = model(x, context)
-    return value, antivalue, policy[0], variance,antivariance, updated_ctx.squeeze(0)
+    return value, antivalue, policy[0], variance, updated_ctx.squeeze(0)
     
 # ---- Example usage ----
 if __name__ == "__main__":
