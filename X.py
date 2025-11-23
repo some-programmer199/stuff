@@ -12,7 +12,7 @@ from typing import Dict, Tuple, Optional, List, Any
 import lmdb
 import os
 import numpy as _np
-TEMPERATURE = 10e10
+TEMPERATURE = 1.0
 global avearage_variance
 avearage_variance=1.0
 global ix
@@ -202,6 +202,7 @@ def worker_process(root_id: int, env_path: str, eval_request_queue: multiprocess
         b = txn.get(f'node_{nid}'.encode())
         return pickle.loads(b) if b is not None else None
 
+    selection_count = 0
     while not shutdown_event.is_set():
         try:
             with wenv.begin() as txn:
@@ -237,18 +238,39 @@ def worker_process(root_id: int, env_path: str, eval_request_queue: multiprocess
                     parent_N = max(1, sum(max(1, ch.get('N', 0)) for ch in child_dicts))
                     best_score = -float('inf')
                     best_idx = 0
+                    debug_scores = []
                     for i, ch in enumerate(child_dicts):
                         exploit_val = ch.get('Q', 0.0) if ch.get('turn', 1) != root_turn else ch.get('antiQ', 0.0)
                         exploitation = float(weights[i]) * float(exploit_val)
-                        u = 2.5 * float(priors[i]) * math.sqrt(parent_N) / (1 + ch.get('N', 0))*  (1 + ch.get('variance', 1.0))
-                        global avearage_variance
-                        avearage_variance+=u
-                        global ix
-                        ix+=1
+                        variance_term = 1.0 + ch.get('variance', 1.0)
+                        u = 2.5 * float(priors[i]) * math.sqrt(parent_N) / (1 + ch.get('N', 0)) * variance_term
                         score = exploitation + u
+                        debug_scores.append({
+                            'move_idx': i,
+                            'exploit': exploitation,
+                            'prior': float(priors[i]),
+                            'N': ch.get('N', 0),
+                            'variance': ch.get('variance', 1.0),
+                            'u_term': u,
+                            'score': score
+                        })
                         if score > best_score:
                             best_score = score
                             best_idx = i
+                    
+                    # print debug info occasionally
+                    selection_count += 1
+                    if selection_count % 50 == 0:
+                        print(f"\n[Worker Selection #{selection_count}] parent_N={parent_N}, TEMP={TEMPERATURE}")
+                        for d in debug_scores:
+                            is_best = " <-- BEST" if d['move_idx'] == best_idx else ""
+                            print(f"  Move {d['move_idx']}: exploit={d['exploit']:.4f}, prior={d['prior']:.4f}, N={d['N']}, var={d['variance']:.4f}, U={d['u_term']:.4f}, score={d['score']:.4f}{is_best}")
+                    
+                    global avearage_variance
+                    avearage_variance += debug_scores[best_idx]['u_term']
+                    global ix
+                    ix += 1
+                    
                     node = child_dicts[best_idx]
                     path.append(node['id'])
                 # leaf found -> request evaluation
@@ -312,10 +334,10 @@ class MCTS:
         else:
             try:
                 raw = self.evaluator(mnode.state)
-                if raw is None or not isinstance(raw, (tuple, list)) or len(raw) < 6:
+                if raw is None or not isinstance(raw, (tuple, list)):
                     res = self._default_eval(mnode.state)
                 else:
-                    v, av, pol_raw, var, avar, ctx = raw
+                    v, av, pol_raw, var, ctx = raw
                     # build legal policy
                     legal = list(board.legal_moves)
                     policy = {}
