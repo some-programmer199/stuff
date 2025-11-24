@@ -52,7 +52,7 @@ def lmdb_get_node(node_id: int, writable: bool = False) -> Optional[Dict[str, An
     path = f'node_{node_id}'.encode()
     # child processes should open their own env; main process can reuse global env
     if writable:
-        with env.begin(write=False) as txn:
+        with env.begin(write=True) as txn:
             data = txn.get(path)
     else:
         # readonly access (safe for workers if they open their own env in their process)
@@ -506,11 +506,11 @@ class MCTS:
                     else:
                         try:
                             raw = self.evaluator(node)
-                            if raw is None or not isinstance(raw, (tuple, list)) or len(raw) < 6:
+                            if raw is None or not isinstance(raw, (tuple, list)):
                                 results.append(self._default_eval(node))
                             else:
                                 # evaluator returns (v, av, pol_raw, var, avar, ctx)
-                                v, av, pol_raw, var, avar, ctx = raw
+                                v, av, pol_raw, var, ctx = raw
                                 # normalize pol_raw into dict for expansion convenience
                                 if isinstance(pol_raw, dict):
                                     policy_dict = {k: float(vv) for k, vv in pol_raw.items()}
@@ -518,7 +518,7 @@ class MCTS:
                                     # fallback uniform over legal moves
                                     legal = list(node.board.legal_moves)
                                     policy_dict = {m.uci(): 1.0/len(legal) for m in legal}
-                                results.append((policy_dict, float(v), float(av), float(var), float(avar), pickle.dumps(ctx)))
+                                results.append((policy_dict, float(v), float(av), float(var), pickle.dumps(ctx)))
                         except Exception:
                             results.append(self._default_eval(node))
 
