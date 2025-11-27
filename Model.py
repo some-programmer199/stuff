@@ -1,185 +1,202 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# X.py
+import os
+import time
+import random
+import pickle
 import chess
-from Search import *
-from moves import pmoves
-# Configuration
-CONTEXT_LENGTH = 256*4  # total context vector size
-CTX_TOKENS = 4   # number of context tokens (CTX_TOKENS * encoder_dim == CONTEXT_LENGTH)
-MAX_PIECES = 33        # number of piece slots in board encoding
-ENCODER_DIM = 256       # per-token embedding dim (must satisfy CTX_TOKENS * ENCODER_DIM == CONTEXT_LENGTH)
+import torch
+import numpy as np
+import multiprocessing as mp
+from tqdm import tqdm
+import lmdb
+from typing import Optional, List, Dict, Any
+from Model import ChessAttention, evaluator, MAX_PIECES, CONTEXT_LENGTH
 
-assert CTX_TOKENS * ENCODER_DIM == CONTEXT_LENGTH, "CTX_TOKENS * ENCODER_DIM must equal CONTEXT_LENGTH"
+os.makedirs('./lmdb_data', exist_ok=True)
+env = lmdb.open('./lmdb_data', map_size=2**40, writemap=True)
 
-
-# ---- Small cross-attention updater (low param) ----
-class SmallCrossAttnUpdater(nn.Module):
-    def __init__(self,
-                 ctx_dim=CONTEXT_LENGTH,
-                 new_dim=256,
-                 hidden_q=128,
-                 hidden_kv=32,
-                 M=4,
-                 num_heads=8,
-                 eps=1e-5):
-        super().__init__()
-        assert hidden_q % num_heads == 0
-        self.ctx_dim = ctx_dim
-        self.new_dim = new_dim
-        self.hidden_q = hidden_q
-        self.hidden_kv = hidden_kv
-        self.M = M
-
-        self.ctx_to_q = nn.Linear(ctx_dim, hidden_q, bias=True)
-        self.new_to_kv = nn.Linear(new_dim, M * hidden_kv, bias=True)
-
-        # Cross-attention: queries hidden_q, keys/values hidden_kv
-        self.mha = nn.MultiheadAttention(embed_dim=hidden_q,
-                                         num_heads=num_heads,
-                                         kdim=hidden_kv,
-                                         vdim=hidden_kv,
-                                         batch_first=True,
-                                         dropout=0.0)
-
-        self.out_map = nn.Linear(hidden_q, ctx_dim, bias=True)
-
-        # tiny learned per-dim gate
-        self.gate = nn.Parameter(torch.zeros(ctx_dim))
-        self.ln = nn.LayerNorm(ctx_dim, eps=eps)
-
-    def forward(self, ctx, new, new_mask=None):
-        """
-        ctx: (B, ctx_dim)
-        new: (B, new_dim)
-        """
-        B = ctx.shape[0]
-        q = self.ctx_to_q(ctx).unsqueeze(1)                      # (B,1,hidden_q)
-        kv = self.new_to_kv(new).view(B, self.M, self.hidden_kv) # (B,M,hidden_kv)
-        attn_out, attn_weights = self.mha(query=q, key=kv, value=kv,
-                                          key_padding_mask=new_mask)  # (B,1,hidden_q)
-        attn_out = attn_out.squeeze(1)                           # (B, hidden_q)
-        attn_mapped = self.out_map(attn_out)                     # (B, ctx_dim)
-
-        g = torch.sigmoid(self.gate)                             # (ctx_dim,)
-        updated = g * attn_mapped + (1.0 - g) * ctx              # (B, ctx_dim)
-        updated = self.ln(updated)
-        return updated, attn_weights
-
-# ---- Transformer-ish blocks ----
-class ResBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads,
-                                          batch_first=True, dropout=dropout)
-        self.ln1 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim),
-        )
-        self.ln2 = nn.LayerNorm(dim)
-
-    def forward(self, x, attn_mask=None):
-        # x: (B, S, dim)
-        attn_out, _ = self.attn(x, x, x, key_padding_mask=attn_mask)
-        x = x + attn_out
-        x = self.ln1(x)
-        f = self.ffn(x)
-        x = x + f
-        x = self.ln2(x)
-        return x
-
-# ---- Full model integrating Node ----
-class ChessAttention(nn.Module):
-    def __init__(self, num_heads=16, dropout=0.1, encoder_dim=ENCODER_DIM,
-                 resblocks=16, ctx_tokens=CTX_TOKENS, context_length=CONTEXT_LENGTH,
-                 new_dim=512):
-        super().__init__()
-        assert ctx_tokens * encoder_dim == context_length
-        self.encoder = nn.Linear(4, encoder_dim)
-        self.self_attn = nn.MultiheadAttention(embed_dim=encoder_dim,
-                                               num_heads=num_heads,
-                                               batch_first=True,
-                                               dropout=dropout)
-        self.resblocks = nn.ModuleList([ResBlock(encoder_dim, num_heads=num_heads, dropout=dropout)
-                                        for _ in range(resblocks)])
-        # project pooled token features to new vector (256)
-        self.new_proj = nn.Sequential(
-            nn.Linear(encoder_dim, encoder_dim * 2),
-            nn.ReLU(),
-            nn.Linear(encoder_dim * 2, new_dim)
-        )
-        # example prediction head (optional)
-        self.pred_head = nn.Sequential(
-            nn.Linear(encoder_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 4)
-        )
-        self.policy_head = nn.Sequential(
-            nn.Linear(encoder_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, len(pmoves))
-        )
-        self.context_updater = SmallCrossAttnUpdater(ctx_dim=context_length,
-                                                     new_dim=new_dim,
-                                                     hidden_q=128,
-                                                     hidden_kv=32,
-                                                     M=4,
-                                                     num_heads=8)
-    def forward(self, x, context=None):
-        """
-        x: (B, MAX_PIECES, 4)
-        context: (B, CONTEXT_LENGTH) or None
-        returns: pred (B,4), updated_context (B,CONTEXT_LENGTH), attn_weights
-        """
-        B = x.shape[0]
-        device = x.device
-        dtype = x.dtype
+class Node:
+    def __init__(self, board: chess.Board, context: Optional[torch.Tensor] = None):
+        self.board = board
+        self.board_tensor = self._to_tensor()
         if context is None:
-            context = torch.zeros(B, CONTEXT_LENGTH, device=device, dtype=dtype)
-        assert x.shape[1] == MAX_PIECES and x.shape[2] == 4
+            context = torch.zeros(CONTEXT_LENGTH)
+        self.context = context.clone().detach() if isinstance(context, torch.Tensor) else torch.from_numpy(context).float()
 
-        # encode piece tokens
-        x = self.encoder(x.view(B * MAX_PIECES, 4)).view(B, MAX_PIECES, -1)  # (B,32,encoder_dim)
+    def _to_tensor(self):
+        t = torch.zeros((MAX_PIECES, 4), dtype=torch.float32)
+        for i, (sq, p) in enumerate(board.piece_map().items()):
+            if i >= MAX_PIECES - 1: break
+            t[i, 0] = p.piece_type - 1
+            t[i, 1] = int(p.color)
+            t[i, 2] = (sq // 8) - 3.5
+            t[i, 3] = (sq % 8) - 3.5
+        t[-1, 0] = 10.0
+        t[-1, 1] = board.ply()
+        return t
 
-        # reshape context into tokens and concat
-        ctx_tokens = context.view(B, CTX_TOKENS, -1)  # (B, ctx_tokens, encoder_dim)
-        x = torch.cat([x, ctx_tokens], dim=1)         # (B, 32+ctx_tokens, encoder_dim)
+    def to(self, device):
+        self.board_tensor = self.board_tensor.to(device)
+        self.context = self.context.to(device)
+        return self
 
-        # self-attention + resblocks
-        x, _ = self.self_attn(x, x, x)
-        for rb in self.resblocks:
-            x = rb(x)
 
-        # produce new vector by pooling and projecting
-        pooled = x.mean(dim=1)         # (B, encoder_dim)
-        new = self.new_proj(pooled)    # (B, new_dim)
+class MCTSNode:
+    _id_counter = mp.Value('i', 0)
+    def __init__(self, state: Node, parent, prior: float, move_uci: Optional[str], turn: chess.Color):
+        with MCTSNode._id_counter.get_lock():
+            self.id = MCTSNode._id_counter.value
+            MCTSNode._id_counter.value += 1
+        self.state = state
+        self.parent = parent
+        self.move = move_uci
+        self.turn = turn
+        self.prior = prior
+        self.children: Dict[str, int] = {}
+        self.N = self.W = self.W_anti = 0
+        self.Q = self.antiQ = self.variance = 0.0
+        self.is_expanded = False
+        self._save()
 
-        # update context
-        updated_ctx, attn_w = self.context_updater(context, new)
+    def _save(self):
+        d = {
+            'id': self.id, 'fen': self.state.board.fen(), 'move': self.move,
+            'N': self.N, 'W': self.W, 'W_anti': self.W_anti, 'Q': self.Q, 'antiQ': self.antiQ,
+            'variance': self.variance, 'is_expanded': self.is_expanded,
+            'children': self.children.copy(), 'turn': int(self.turn),
+            'prior': self.prior, 'context': pickle.dumps(self.state.context.cpu())
+        }
+        with env.begin(write=True) as txn:
+            txn.put(f'node_{self.id}'.encode(), pickle.dumps(d))
 
-        # optional prediction
-        pred = self.pred_head(pooled)
-        pred=pred[0]
-        value=torch.tanh(pred[0]).item()
-        antivalue=torch.tanh(pred[2]).item()
-        variance=torch.tanh(pred[1]).item()
-        antivariance=torch.exp(pred[3]).item()
-        policy=self.policy_head(pooled)
-        return value, antivalue,variance,antivariance, policy.tolist(), updated_ctx
-def evaluator(node:Node,model:ChessAttention):
-    x= node.board_tensor.unsqueeze(0)  # (1, MAX_PIECES, 4)
-    context= node.context.unsqueeze(0)  # (1, CONTEXT_LENGTH)
-    value, antivalue,variance,antivariance, policy, updated_ctx = model(x, context)
-    return value, antivalue, policy[0], variance, updated_ctx.squeeze(0)
-    
-# ---- Example usage ----
+
+class MCTS:
+    def __init__(self, model: ChessAttention, num_workers=4, batch_size=32):
+        self.model = model.eval()
+        self.model.share_memory()
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        self.eval_queue = mp.Queue(maxsize=1024)
+        self.shutdown = mp.Event()
+        self.workers: List[mp.Process] = []
+
+    def _worker(self, root_id: int):
+        while not self.shutdown.is_set():
+            try:
+                with env.begin() as txn:
+                    root_data = txn.get(f'node_{root_id}'.encode())
+                    if not root_data: continue
+                    node = pickle.loads(root_data)
+                    path = [node['id']]
+                    while node['is_expanded'] and node['children']:
+                        # simple max-N selection for speed in worker
+                        child_id = max(node['children'].values(), key=lambda cid: pickle.loads(txn.get(f'node_{cid}'.encode()) or b'')get('N',0))
+                        node = pickle.loads(txn.get(f'node_{child_id}'.encode()))
+                        path.append(child_id)
+                    self.eval_queue.put((node['id'], node['fen'], node['context'], path))
+            except:
+                time.sleep(0.01)
+
+    def search(self, board: chess.Board, sims: int = 1600, context=None):
+        root_state = Node(board, context)
+        root = MCTSNode(root_state, None, 1.0, None, board.turn)
+        self._expand_root(root)
+
+        for _ in range(self.num_workers):
+            p = mp.Process(target=self._worker, args=(root.id,), daemon=True)
+            p.start()
+            self.workers.append(p)
+
+        pbar = tqdm(total=sims, desc="MCTS (batched)", colour="cyan")
+        done = 0
+        while done < sims:
+            batch = []
+            while len(batch) < self.batch_size and done < sims:
+                try:
+                    batch.append(self.eval_queue.get(timeout=0.5))
+                    done += 1
+                except:
+                    break
+
+            if not batch: continue
+
+            nodes = []
+            for _, fen, ctx_pickled, _ in batch:
+                board = chess.Board(fen)
+                ctx = pickle.loads(ctx_pickled) if isinstance(ctx_pickled, (bytes, bytearray)) else ctx_pickled
+                node = Node(board, ctx).to('cuda' if torch.cuda.is_available() else 'cpu')
+                nodes.append(node)
+
+            # REAL BATCH EVAL
+            x = torch.stack([n.board_tensor for n in nodes])
+            c = torch.stack([n.context for n in nodes])
+            with torch.no_grad():
+                v, av, var, _, pol, new_ctx = self.model(x, c)
+
+            # Backup each
+            for i, (leaf_id, _, _, path) in enumerate(batch):
+                self._backup(
+                    leaf_id=leaf_id,
+                    path=path,
+                    value=v[i].item(),
+                    antivalue=av[i].item(),
+                    variance=var[i].item(),
+                    new_context=new_ctx[i].cpu(),
+                    policy_logits=pol[i].cpu()
+                )
+            pbar.update(len(batch))
+
+        self.shutdown.set()
+        for p in self.workers: p.join(1)
+        pbar.close()
+
+        # Pick best move
+        with env.begin() as txn:
+            root_data = pickle.loads(txn.get(f'node_{root.id}'.encode()))
+            visits = {}
+            for uci, cid in root_data['children'].items():
+                child = pickle.loads(txn.get(f'node_{cid}'.encode()))
+                visits[uci] = child['N']
+        best = max(visits, key=visits.get)
+        return best, visits
+
+    def _expand_root(self, root: MCTSNode):
+        policy, v, av, var, _, ctx = evaluator(root.state, self.model)
+        board = root.state.board
+        for move in board.legal_moves:
+            uci = move.uci()
+            board.push(move)
+            child = MCTSNode(Node(board, ctx), root, policy.get(uci, 0.0), uci, not board.turn)
+            root.children[uci] = child.id
+            board.pop()
+        root.is_expanded = True
+        root.N = 1; root.W = v; root.W_anti = av; root.Q = v; root.antiQ = av; root.variance = var
+        root._save()
+
+    def _backup(self, leaf_id, path, value, antivalue, variance, new_context, policy_logits):
+        # simplified backup - just update N/W/variance
+        for nid in reversed(path):
+            with env.begin(write=True) as txn:
+                data = pickle.loads(txn.get(f'node_{nid}'.encode()))
+                data['N'] += 1
+                data['W'] += value
+                data['W_anti'] += antivalue
+                data['Q'] = data['W'] / data['N']
+                data['antiQ'] = data['W_anti'] / data['N']
+                if nid == leaf_id:
+                    data['variance'] = variance
+                    data['is_expanded'] = True
+                    data['context'] = pickle.dumps(new_context)
+                txn.put(f'node_{nid}'.encode(), pickle.dumps(data))
+
+
 if __name__ == "__main__":
-    
-
     model = ChessAttention()
-    
-    print("Total params:", sum(p.numel() for p in model.parameters()))
-   
-    
+    if torch.cuda.is_available():
+        model = model.cuda()
+
+    mcts = MCTS(model, num_workers=6, batch_size=48)
+    board = chess.Board()
+    best_move, visits = mcts.search(board, sims=1024)
+    print(f"\nBest move: {best_move}")
+    print("Top moves:", sorted(visits.items(), key=lambda x: -x[1])[:8])
