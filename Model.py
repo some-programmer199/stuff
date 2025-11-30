@@ -173,7 +173,14 @@ def evaluator(node:Node,model:ChessAttention):
     context= node.context.unsqueeze(0)  # (1, CONTEXT_LENGTH)
     value, antivalue,variance,antivariance, policy, updated_ctx = model(x, context)
     return value, antivalue, policy[0], variance, updated_ctx.squeeze(0)
-    
+def evaluator(nodes:list[Node],model:ChessAttention):
+    x= torch.stack([node.board_tensor for node in nodes],dim=0)  # (B, MAX_PIECES, 4)
+    context= torch.stack([node.context for node in nodes],dim=0)  # (B, CONTEXT_LENGTH)
+    values, antivalues, variances, antivariances, policies, updated_ctxs = model(x, context)
+    results = []
+    for i in range(len(nodes)):
+        results.append( (values[i].item(), antivalues[i].item(), policies[i], variances[i].item(), updated_ctxs[i]) )
+    return results
 # ---- Example usage ----
 if __name__ == "__main__":
     
