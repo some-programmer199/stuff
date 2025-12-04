@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from moves import pmoves
 
 # ---------------- Configuration ----------------
-MAX_PIECES = 32          # rounded for nice token size
+MAX_PIECES = 33        # rounded for nice token size
 CTX_TOKENS = 4           # number of context tokens
 ENCODER_DIM = 256        # per-token embedding dim
 CONTEXT_LENGTH = CTX_TOKENS * ENCODER_DIM
