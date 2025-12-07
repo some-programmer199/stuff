@@ -1,14 +1,14 @@
 import math, random, pickle, time, os, threading
-import torch, chess, lmdb, numpy as np
+import torch, chess, lmdb,tqdm, numpy as np
 import multiprocessing as mp
 from typing import List, Dict,Tuple, Optional, Any
 import moves
 # ====================
 # CONFIG
 # ====================
-TEMPERATURE = 250
+TEMPERATURE = 2.5
 DEPTH_NOISE_END = 10
-DEPTH_NOISE_SCALE = 50.0  # reduced from 100
+DEPTH_NOISE_SCALE = 5.0  # reduced from 100
 MAX_PIECES = 33
 CONTEXT_LENGTH = 256*4
 LMDB_PATH = './lmdb_data'
@@ -142,7 +142,7 @@ def worker_process(root_id: int, env_path: str, eval_queue: mp.Queue, shutdown_e
                 depth = 0
 
                 # traverse tree
-                while node.get('is_expanded') and node.get('children'):
+                while node.get('is_expanded'):
                     children = []
                     for cid in node['children'].values():
                         if cid in local_cache:
@@ -232,7 +232,7 @@ class MCTS:
                            args=(root.id, LMDB_PATH, self._eval_queue, self._shutdown_event, self.c_puct,self.dirichlet_alpha,self.dirichlet_epsilon))
             p.start()
             self._workers.append(p)
-
+        bar=tqdm.tqdm(total=num_sims)
         sims_done = 0
         while sims_done<num_sims:
             batch=[]
@@ -261,6 +261,8 @@ class MCTS:
                 policy,v,av,var,ctx_p=results[i]
                 self._expand_and_backup(leaf_id, policy,v,av,var,ctx_p,path)
                 sims_done+=1
+                bar.update(1)
+        bar.close()
 
         # shutdown workers
         self._shutdown_event.set()
@@ -300,6 +302,7 @@ class MCTS:
                 nd['N']+=1; nd['W']+=v; nd['W_anti']+=av
                 nd['Q']=nd['W']/nd['N']; nd['antiQ']=nd['W_anti']/nd['N']; nd['variance']=var
                 lmdb_put_node(nd)
+                
     def close(self):
         if self._shutdown_event:
             self._shutdown_event.set()
@@ -309,6 +312,7 @@ class MCTS:
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 from Model import  ChessAttention
 def batch_evaluator(nodes: List[Node]) -> List[Tuple[dict, float, float, float, torch.Tensor]]:
+    print(random.choice(nodes).board)
     tens= torch.stack([n.board_tensor for n in nodes], dim=0).to('cpu')
     contexts= torch.stack([n.context for n in nodes], dim=0).to('cpu')
     values, antivalues,variances, policy_logits,new_contexts = model(tens, contexts)
@@ -322,7 +326,7 @@ def batch_evaluator(nodes: List[Node]) -> List[Tuple[dict, float, float, float, 
             for j, m in enumerate(legal):
                 idx = moves.pmove_to_idx.get(m.uci(), -1)
                 if 0 <= idx < policy_logits.size(1):
-                    logits[j] = float(policy_logits[i, idx])
+                    logits[j] = float(policy_logits[i, idx].detach().cpu())
             if logits.isfinite().any():
                 probs = torch.softmax(logits / max(1e-6, TEMPERATURE), dim=0)
                 policy = {m.uci(): p for m, p in zip(legal, probs.tolist())}
@@ -338,7 +342,7 @@ def batch_evaluator(nodes: List[Node]) -> List[Tuple[dict, float, float, float, 
 if __name__ == "__main__":
     model=ChessAttention()
 
-    print("Total params:", sum(p.numel() for p in model.parameters()))
+    
     
     board = chess.Board()
     root=MCTSNode(Node(board), None, 1.0, None, board.turn)
@@ -347,5 +351,6 @@ if __name__ == "__main__":
     print("Best move:", move)
     print("Visit distribution:", {chess.Move.from_uci(uci).uci(): n for uci, n in visits.items()})
     mcts.close()
+    print(mcts._workers)
     
 
