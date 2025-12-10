@@ -766,4 +766,3 @@ if __name__ == "__main__":
     print("Visit distribution:", {chess.Move.from_uci(uci).uci(): n for uci, n in visits.items()})
     mcts.close()
     
-
