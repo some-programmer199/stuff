@@ -15,7 +15,15 @@ MAX_PIECES = 33
 CONTEXT_LENGTH = 256 * 4
 LMDB_PATH = './lmdb_data'
 os.makedirs(LMDB_PATH, exist_ok=True)
-
+#delete existing LMDB for fresh start
+if os.path.exists(LMDB_PATH):
+    for file in os.listdir(LMDB_PATH):
+        file_path = os.path.join(LMDB_PATH, file)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+        except Exception as e:
+            print(f'Error deleting file {file_path}: {e}')
 # ====================
 # LMDB ENV FACTORY
 # ====================
