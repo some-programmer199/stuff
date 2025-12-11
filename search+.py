@@ -638,19 +638,16 @@ def main():
     args = parse_args()
 
     # clean LMDB dir for fresh run (optional)
-    if os.path.exists(LMDB_PATH):
-        for file in os.listdir(LMDB_PATH):
-            file_path = os.path.join(LMDB_PATH, file)
-            try:
-                if os.path.isfile(file_path):
-                    os.unlink(file_path)
-            except Exception:
-                pass
-
+    print("Clearing LMDB data...")
+    with get_env(write=True).begin(write=True) as txn:
+        cursor = txn.cursor()
+        for key, _ in cursor:
+            txn.delete(key)
+    print("LMDB data cleared.")
     # initial root node
     root_board = chess.Board()
     root_node = MCTSNode(Node(root_board), None, 1.0, None, root_board.turn)
-
+    print("Initial position:\n", root_board)
     mcts = MCTS(mode=args.mode, num_workers=args.num_workers, batch_size=args.batch_size, num_sims=args.num_sims)
     print(f"Starting MCTS in {args.mode.upper()} mode: {args.num_sims} sims, {args.num_workers} CPU workers, batch_size={args.batch_size}")
     move, visits, child = mcts.mp_search(root_node)
