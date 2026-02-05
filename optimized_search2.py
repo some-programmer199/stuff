@@ -1,196 +1,516 @@
-import torch, chess, math, random
+import torch
+import chess
+import math
 import numpy as np
-from Model import ChessAttention
+from optimized_model import ChessAttention
 import moves
+import tqdm
+import multiprocessing as mp
+from multiprocessing import Queue, Process, Value, Array, Manager
+import ctypes
+import time
+import os
 
 # ---------------- Config ----------------
 MAX_NODES = 500_000
-MAX_CHILDREN = 256
 CONTEXT_LENGTH = 2688
 MAX_PIECES = 33
 C_PUCT = 2.0
 VIRTUAL_LOSS = 3.0
 TEMPERATURE = 2.5
+NUM_WORKERS = 4  # Start with fewer workers
+BATCH_SIZE = 16  # Smaller batch size to start
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------- Node Tables ----------------
-N      = torch.zeros(MAX_NODES, dtype=torch.int32)
-W      = torch.zeros(MAX_NODES, dtype=torch.float32)
-Wanti  = torch.zeros(MAX_NODES, dtype=torch.float32)
-Q      = torch.zeros(MAX_NODES, dtype=torch.float32)
-antiQ  = torch.zeros(MAX_NODES, dtype=torch.float32)
-VAR    = torch.ones(MAX_NODES, dtype=torch.float32)
-PRIOR  = torch.zeros(MAX_NODES, dtype=torch.float32)
-TURN   = torch.zeros(MAX_NODES, dtype=torch.bool)
-VLOSS  = torch.zeros(MAX_NODES, dtype=torch.int16)
-EXP    = torch.zeros(MAX_NODES, dtype=torch.bool)
+# ---------------- Shared Arrays using multiprocessing.Array ----------------
+def create_shared_arrays():
+    """Create shared arrays using multiprocessing.Array (more reliable than shared_memory)"""
+    arrays = {
+        'N': Array(ctypes.c_int32, MAX_NODES, lock=False),
+        'W': Array(ctypes.c_float, MAX_NODES, lock=False),
+        'Wanti': Array(ctypes.c_float, MAX_NODES, lock=False),
+        'Q': Array(ctypes.c_float, MAX_NODES, lock=False),
+        'antiQ': Array(ctypes.c_float, MAX_NODES, lock=False),
+        'VAR': Array(ctypes.c_float, MAX_NODES, lock=False),
+        'PRIOR': Array(ctypes.c_float, MAX_NODES, lock=False),
+        'TURN': Array(ctypes.c_bool, MAX_NODES, lock=False),
+        'VLOSS': Array(ctypes.c_int16, MAX_NODES, lock=False),
+        'EXP': Array(ctypes.c_bool, MAX_NODES, lock=False),
+        'PARENT': Array(ctypes.c_int32, MAX_NODES, lock=False),
+        'CH_PTR': Array(ctypes.c_int32, MAX_NODES, lock=False),
+        'CH_LEN': Array(ctypes.c_int16, MAX_NODES, lock=False),
+        'CH_BUF': Array(ctypes.c_int32, MAX_NODES * 8, lock=False),
+        'QW_BUF': Array(ctypes.c_float, MAX_NODES * 8, lock=False),
+        'NODE_LOCKS': Array(ctypes.c_uint8, MAX_NODES, lock=False),
+    }
+    
+    # Initialize
+    for i in range(MAX_NODES):
+        arrays['VAR'][i] = 1.0
+        arrays['PARENT'][i] = -1
+    
+    for i in range(MAX_NODES * 8):
+        arrays['CH_BUF'][i] = -1
+    
+    return arrays
 
-PARENT = torch.full((MAX_NODES,), -1, dtype=torch.int32)
-CH_PTR = torch.zeros(MAX_NODES, dtype=torch.int32)
-CH_LEN = torch.zeros(MAX_NODES, dtype=torch.int16)
-CH_BUF = torch.full((MAX_NODES*8,), -1, dtype=torch.int32)
-QW_BUF = torch.zeros(MAX_NODES*8, dtype=torch.float32)  # softmax weights
+def create_shared_tensors():
+    """Create large tensor arrays separately"""
+    # Use RawArray for large tensors (no locking overhead)
+    ctx_array = mp.RawArray(ctypes.c_float, MAX_NODES * CONTEXT_LENGTH)
+    board_array = mp.RawArray(ctypes.c_float, MAX_NODES * MAX_PIECES * 4)
+    return ctx_array, board_array
 
-CTX   = torch.zeros((MAX_NODES, CONTEXT_LENGTH), dtype=torch.float32)
-BOARD = torch.zeros((MAX_NODES, MAX_PIECES, 4), dtype=torch.float32)
+# ---------------- Worker Globals ----------------
+N = W = Wanti = Q = antiQ = VAR = PRIOR = TURN = VLOSS = EXP = None
+PARENT = CH_PTR = CH_LEN = CH_BUF = QW_BUF = NODE_LOCKS = None
+CTX_RAW = BOARD_RAW = None
+board_manager = None
 
-# Python board objects for expansion only
-BOARD_OBJ = {}
+def init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr):
+    """Initialize arrays in worker process"""
+    global N, W, Wanti, Q, antiQ, VAR, PRIOR, TURN, VLOSS, EXP
+    global PARENT, CH_PTR, CH_LEN, CH_BUF, QW_BUF, NODE_LOCKS
+    global CTX_RAW, BOARD_RAW, board_manager
+    
+    N = shared_arrays['N']
+    W = shared_arrays['W']
+    Wanti = shared_arrays['Wanti']
+    Q = shared_arrays['Q']
+    antiQ = shared_arrays['antiQ']
+    VAR = shared_arrays['VAR']
+    PRIOR = shared_arrays['PRIOR']
+    TURN = shared_arrays['TURN']
+    VLOSS = shared_arrays['VLOSS']
+    EXP = shared_arrays['EXP']
+    PARENT = shared_arrays['PARENT']
+    CH_PTR = shared_arrays['CH_PTR']
+    CH_LEN = shared_arrays['CH_LEN']
+    CH_BUF = shared_arrays['CH_BUF']
+    QW_BUF = shared_arrays['QW_BUF']
+    NODE_LOCKS = shared_arrays['NODE_LOCKS']
+    CTX_RAW = ctx_raw
+    BOARD_RAW = board_raw
+    board_manager = board_mgr
 
-node_top = 0
-child_top = 0
+# ---------------- Helper Functions ----------------
+def get_ctx(nid):
+    """Get context for a node"""
+    start = nid * CONTEXT_LENGTH
+    return np.frombuffer(CTX_RAW, dtype=np.float32, count=CONTEXT_LENGTH, offset=start*4)
 
-# ---------------- Helpers ----------------
-def alloc_node():
-    global node_top
-    nid = node_top
-    node_top += 1
-    return nid
+def set_ctx(nid, ctx):
+    """Set context for a node"""
+    start = nid * CONTEXT_LENGTH
+    arr = np.frombuffer(CTX_RAW, dtype=np.float32, count=CONTEXT_LENGTH, offset=start*4)
+    arr[:] = ctx
 
-def alloc_children(k):
-    global child_top
-    ptr = child_top
-    child_top += k
-    return ptr
+def get_board(nid):
+    """Get board tensor for a node"""
+    start = nid * MAX_PIECES * 4
+    return np.frombuffer(BOARD_RAW, dtype=np.float32, count=MAX_PIECES*4, offset=start*4).reshape(MAX_PIECES, 4)
+
+def set_board(nid, board_tensor):
+    """Set board tensor for a node"""
+    start = nid * MAX_PIECES * 4
+    arr = np.frombuffer(BOARD_RAW, dtype=np.float32, count=MAX_PIECES*4, offset=start*4)
+    arr[:] = board_tensor.flatten()
 
 def board_to_tensor(board):
-    tens = torch.zeros((MAX_PIECES,4))
-    for i,(sq,pc) in enumerate(board.piece_map().items()):
-        if i>=MAX_PIECES-1: break
-        tens[i,0] = pc.piece_type-1
-        tens[i,1] = float(pc.color)
-        tens[i,2] = (sq>>3)-3.5
-        tens[i,3] = (sq&7)-3.5
-    tens[MAX_PIECES-1,0] = 10.0
-    tens[MAX_PIECES-1,1] = float(board.ply())
+    tens = np.zeros((MAX_PIECES, 4), dtype=np.float32)
+    for i, (sq, pc) in enumerate(board.piece_map().items()):
+        if i >= MAX_PIECES - 1:
+            break
+        tens[i, 0] = pc.piece_type - 1
+        tens[i, 1] = float(pc.color)
+        tens[i, 2] = (sq >> 3) - 3.5
+        tens[i, 3] = (sq & 7) - 3.5
+    tens[MAX_PIECES - 1, 0] = 10.0
+    tens[MAX_PIECES - 1, 1] = float(board.ply())
     return tens
 
-# ---------------- Tree Policy ----------------
+def alloc_node(node_counter, node_lock):
+    with node_lock:
+        nid = node_counter.value
+        node_counter.value += 1
+        return nid
+
+def alloc_children(k, child_counter, child_lock):
+    with child_lock:
+        ptr = child_counter.value
+        child_counter.value += k
+        return ptr
+
+def acquire_node(nid):
+    """Simple spinlock"""
+    max_attempts = 1000
+    for attempt in range(max_attempts):
+        if NODE_LOCKS[nid] == 0:
+            NODE_LOCKS[nid] = 1
+            return True
+        time.sleep(0.0001)
+    return False
+
+def release_node(nid):
+    NODE_LOCKS[nid] = 0
+
+# ---------------- Tree Operations ----------------
 def select_path(root):
     path = [root]
     nid = root
+    
     while EXP[nid] and CH_LEN[nid] > 0:
         ptr = CH_PTR[nid]
         k = CH_LEN[nid]
-        kids = CH_BUF[ptr:ptr+k]
-
-        n = N[kids] + VLOSS[kids]
-        w = W[kids] - VIRTUAL_LOSS*VLOSS[kids]
-        q = w / torch.clamp(n, min=1)
-
-        # antiQ
-        aq = Wanti[kids] / torch.clamp(n, min=1)
-
-        # softmax weighted blend per child
-        weights = QW_BUF[ptr:ptr+k]
-        values = torch.where(TURN[kids]==TURN[nid], q, aq)
-        exploit = weights * values
-
-        # UCT
-        sqrt_parent = math.sqrt(N[nid]+1)
-        u = C_PUCT * PRIOR[kids] * sqrt_parent / (1+n) * (1 + VAR[kids])
-
-        scores = exploit + u
-
-        idx = torch.argmax(scores).item()
-        nid = kids[idx].item()
+        
+        # Safely get children
+        kids = [CH_BUF[ptr + i] for i in range(k)]
+        
+        # Calculate scores
+        scores = []
+        for kid in kids:
+            n = N[kid] + VLOSS[kid]
+            w = W[kid] - VIRTUAL_LOSS * VLOSS[kid]
+            q = w / max(n, 1)
+            aq = Wanti[kid] / max(n, 1)
+            
+            weight = QW_BUF[ptr + len(scores)]
+            value = q if TURN[kid] == TURN[nid] else aq
+            exploit = weight * value
+            
+            sqrt_parent = math.sqrt(N[nid] + 1)
+            u = C_PUCT * PRIOR[kid] * sqrt_parent / (1 + n) * VAR[kid]
+            
+            scores.append(exploit + u)
+        
+        # Select best child
+        idx = scores.index(max(scores))
+        nid = kids[idx]
         VLOSS[nid] += 1
         path.append(nid)
+    
     return nid, path
 
-# ---------------- Expansion ----------------
-def expand(nid, policy, new_ctx, var, softmax_weights):
-    if EXP[nid]: return
-    board = BOARD_OBJ[nid]
-    legal = list(board.legal_moves)
-    if not legal:
-        EXP[nid] = True
+def expand(nid, policy, new_ctx, var, node_counter, node_lock, child_counter, child_lock):
+    if not acquire_node(nid):
         return
-
-    ptr = alloc_children(len(legal))
-    CH_PTR[nid] = ptr
-    CH_LEN[nid] = len(legal)
-
-    for i, mv in enumerate(legal):
-        cid = alloc_node()
-        CH_BUF[ptr+i] = cid
-
-        nb = board.copy(stack=False)
-        nb.push(mv)
-        BOARD_OBJ[cid] = nb
-        BOARD[cid] = board_to_tensor(nb)
-        CTX[cid] = new_ctx
-
-        PARENT[cid] = nid
-        TURN[cid] = not board.turn
-        PRIOR[cid] = policy.get(mv.uci(),0.0)
-        QW_BUF[ptr+i] = softmax_weights.get(mv.uci(),1.0)
-
-    EXP[nid] = True
-    VAR[nid] = var
-
-# ---------------- Backup ----------------
-def backup(path, leaf, v, av, var):
-    P = torch.tensor(path, dtype=torch.long)
-    N[P] += 1
-    same = TURN[P]==TURN[leaf]
-    W[P]     += torch.where(same,v,av)
-    Wanti[P] += torch.where(same,av,v)
-    Q[P]     = W[P]/N[P]
-    antiQ[P] = Wanti[P]/N[P]
-    VAR[P]   = var
-    VLOSS[P] = torch.clamp(VLOSS[P]-1,min=0)
-
-# ---------------- Evaluate ----------------
-def eval_batch(model, leaves):
-    tens = BOARD[leaves].to(device)
-    ctxs = CTX[leaves].to(device)
-    with torch.no_grad():
-        v, av, var, logits, new_ctxs, weights = model(tens, ctxs)  # network returns opponent softmax
-    results = []
-    for i, nid in enumerate(leaves):
-        board = BOARD_OBJ[nid]
+    
+    try:
+        if EXP[nid]:
+            return
+        
+        board = board_manager[nid]
         legal = list(board.legal_moves)
-        policy = {}
-        softmax_weights = {}
-        if legal:
-            idxs = [moves.pmove_to_idx.get(m.uci(),-1) for m in legal]
-            l = torch.full((len(legal),),-1e9,device=device)
-            for j, idx in enumerate(idxs):
-                if 0 <= idx < logits.size(1):
-                    l[j] = logits[i,idx]
-            probs = torch.softmax(l / TEMPERATURE, 0)
-            policy = {m.uci(): float(p) for m,p in zip(legal,probs)}
-            softmax_weights = {m.uci(): float(weights[i,j]) for j,m in enumerate(legal)}
-        results.append((nid, policy, float(v[i]), float(av[i]), float(var[i]), new_ctxs[i].cpu(), softmax_weights))
-    return results
+        if not legal:
+            EXP[nid] = True
+            return
+        
+        ptr = alloc_children(len(legal), child_counter, child_lock)
+        CH_PTR[nid] = ptr
+        CH_LEN[nid] = len(legal)
+        
+        for i, mv in enumerate(legal):
+            cid = alloc_node(node_counter, node_lock)
+            CH_BUF[ptr + i] = cid
+            
+            nb = board.copy(stack=False)
+            nb.push(mv)
+            board_manager[cid] = nb
+            set_board(cid, board_to_tensor(nb))
+            set_ctx(cid, new_ctx)
+            
+            PARENT[cid] = nid
+            TURN[cid] = not board.turn
+            PRIOR[cid] = policy.get(mv.uci(), 0.0)
+        
+        update_weights(nid)
+        EXP[nid] = True
+        VAR[nid] = var
+    finally:
+        release_node(nid)
 
-# ---------------- MCTS Loop ----------------
-def run_mcts(root, model, sims=800):
-    for _ in range(sims):
-        leaf, path = select_path(root)
-        nid, policy, v, av, var, ctx, softmax_weights = eval_batch(model,[leaf])[0]
-        CTX[nid] = ctx
-        expand(nid, policy, ctx, var, softmax_weights)
-        backup(path, nid, v, av, var)
+def update_weights(nid, temp=1.0):
+    ptr = CH_PTR[nid]
+    k = CH_LEN[nid]
+    if k <= 0:
+        return
+    
+    kids = [CH_BUF[ptr + i] for i in range(k)]
+    opp_values = []
+    
+    for kid in kids:
+        n = N[kid] + VLOSS[kid]
+        w = W[kid] - VIRTUAL_LOSS * VLOSS[kid]
+        q = w / max(n, 1)
+        aq = Wanti[kid] / max(n, 1)
+        
+        opp_val = aq if TURN[kid] == TURN[nid] else q
+        opp_values.append(opp_val)
+    
+    # Softmax
+    opp_values = np.array(opp_values)
+    scaled = opp_values / (temp + 1e-12)
+    exp_vals = np.exp(scaled - np.max(scaled))
+    weights = exp_vals / np.sum(exp_vals)
+    
+    for i in range(k):
+        QW_BUF[ptr + i] = weights[i]
 
-    ptr = CH_PTR[root]
-    k = CH_LEN[root]
-    kids = CH_BUF[ptr:ptr+k]
-    visits = N[kids]
-    best = kids[torch.argmax(visits)].item()
-    return best, visits, kids
+def backup(path, leaf, v, av, var):
+    for nid in path:
+        N[nid] += 1
+        if TURN[nid] == TURN[leaf]:
+            W[nid] += v
+            Wanti[nid] += av
+        else:
+            W[nid] += av
+            Wanti[nid] += v
+        
+        Q[nid] = W[nid] / N[nid]
+        antiQ[nid] = Wanti[nid] / N[nid]
+        VAR[nid] = var
+        VLOSS[nid] = max(0, VLOSS[nid] - 1)
+    
+    # Update weights for parents
+    parent_ids = set()
+    for nid in path:
+        pid = PARENT[nid]
+        if pid >= 0 and CH_LEN[pid] > 0:
+            parent_ids.add(pid)
+    for pid in parent_ids:
+        update_weights(pid)
+
+# ---------------- Search Worker ----------------
+def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
+                  node_counter, node_lock, child_counter, child_lock,
+                  eval_queue, result_queue, stop_flag, root_node):
+    try:
+        init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
+        print(f"Worker {worker_id} started")
+        
+        while not stop_flag.value:
+            try:
+                leaf, path = select_path(root_node)
+                
+                if EXP[leaf]:
+                    for nid in path:
+                        VLOSS[nid] = max(0, VLOSS[nid] - 1)
+                    continue
+                
+                eval_queue.put((worker_id, leaf, path))
+                result = result_queue.get(timeout=10)
+                
+                if result is None:
+                    break
+                
+                nid, policy, v, av, var, new_ctx = result
+                set_ctx(nid, new_ctx)
+                expand(nid, policy, new_ctx, var, node_counter, node_lock, child_counter, child_lock)
+                backup(path, nid, v, av, var)
+                
+            except Exception as e:
+                print(f"Worker {worker_id} iteration error: {e}")
+                continue
+        
+        print(f"Worker {worker_id} stopped")
+    except Exception as e:
+        print(f"Worker {worker_id} fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ---------------- Evaluation Worker ----------------
+def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
+                      eval_queue, result_queues, stop_flag, batch_size=BATCH_SIZE):
+    try:
+        init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
+        
+        print("Loading model...")
+        model = ChessAttention().to(device).eval()
+        print(f"Model loaded on {device}")
+        
+        pending_evals = []
+        
+        while not stop_flag.value or not eval_queue.empty():
+            try:
+                # Collect batch
+                timeout = 0.01 if pending_evals else 0.1
+                try:
+                    item = eval_queue.get(timeout=timeout)
+                    if item is None:
+                        break
+                    pending_evals.append(item)
+                except:
+                    pass
+                
+                # Process batch
+                if len(pending_evals) >= batch_size or (pending_evals and eval_queue.empty()):
+                    batch = pending_evals[:batch_size]
+                    pending_evals = pending_evals[batch_size:]
+                    
+                    worker_ids = [item[0] for item in batch]
+                    leaf_nodes = [item[1] for item in batch]
+                    
+                    # Get tensors
+                    boards_list = [get_board(nid) for nid in leaf_nodes]
+                    ctxs_list = [get_ctx(nid) for nid in leaf_nodes]
+                    
+                    boards_torch = torch.tensor(np.array(boards_list), dtype=torch.float32).to(device)
+                    ctxs_torch = torch.tensor(np.array(ctxs_list), dtype=torch.float32).to(device)
+                    
+                    # Evaluate
+                    with torch.no_grad():
+                        v, av, var, logits, new_ctxs = model(boards_torch, ctxs_torch)
+                    
+                    # Process results
+                    results = []
+                    for i, nid in enumerate(leaf_nodes):
+                        board = board_mgr[nid]
+                        legal = list(board.legal_moves)
+                        policy = {}
+                        
+                        if legal:
+                            idxs = [moves.pmove_to_idx.get(m.uci(), -1) for m in legal]
+                            l = torch.full((len(legal),), -1e9, device=device)
+                            for j, idx in enumerate(idxs):
+                                if 0 <= idx < logits.size(1):
+                                    l[j] = logits[i, idx]
+                            probs = torch.softmax(l / TEMPERATURE, 0)
+                            policy = {m.uci(): float(p) for m, p in zip(legal, probs)}
+                        
+                        results.append((
+                            nid,
+                            policy,
+                            float(v[i]),
+                            float(av[i]),
+                            float(var[i]),
+                            new_ctxs[i].cpu().numpy()
+                        ))
+                    
+                    # Send results
+                    for (worker_id, _, _), result in zip(batch, results):
+                        result_queues[worker_id].put(result)
+                        
+            except Exception as e:
+                print(f"Eval worker batch error: {e}")
+                continue
+        
+        # Send stop signals
+        for q in result_queues:
+            q.put(None)
+        
+        print("Evaluation worker stopped")
+    except Exception as e:
+        print(f"Eval worker fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ---------------- Main MCTS ----------------
+def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS):
+    print("Initializing shared memory...")
+    shared_arrays = create_shared_arrays()
+    ctx_raw, board_raw = create_shared_tensors()
+    
+    print("Initializing board manager...")
+    manager = Manager()
+    board_mgr = manager.dict()
+    
+    node_counter = Value('i', 1)
+    node_lock = mp.Lock()
+    child_counter = Value('i', 0)
+    child_lock = mp.Lock()
+    
+    # Initialize root
+    root = 0
+    board_mgr[root] = board
+    
+    # Access raw arrays through numpy
+    board_arr = np.frombuffer(board_raw, dtype=np.float32).reshape(MAX_NODES, MAX_PIECES, 4)
+    ctx_arr = np.frombuffer(ctx_raw, dtype=np.float32).reshape(MAX_NODES, CONTEXT_LENGTH)
+    
+    board_arr[root] = board_to_tensor(board)
+    ctx_arr[root] = 0
+    shared_arrays['TURN'][root] = board.turn
+    shared_arrays['PRIOR'][root] = 1.0
+    
+    eval_queue = Queue(maxsize=num_workers * 4)
+    result_queues = [Queue(maxsize=4) for _ in range(num_workers)]
+    stop_flag = Value('i', 0)
+    
+    print("Starting evaluation worker...")
+    eval_proc = Process(
+        target=evaluation_worker,
+        args=(shared_arrays, ctx_raw, board_raw, board_mgr, eval_queue, result_queues, stop_flag)
+    )
+    eval_proc.start()
+    
+    time.sleep(2)  # Give eval worker time to load model
+    
+    print(f"Starting {num_workers} search workers...")
+    workers = []
+    for i in range(num_workers):
+        p = Process(
+            target=search_worker,
+            args=(i, shared_arrays, ctx_raw, board_raw, board_mgr,
+                  node_counter, node_lock, child_counter, child_lock,
+                  eval_queue, result_queues[i], stop_flag, root)
+        )
+        p.start()
+        workers.append(p)
+    
+    print(f"Running {sims} simulations...")
+    pbar = tqdm.tqdm(total=sims)
+    last_count = 0
+    
+    try:
+        while True:
+            current_count = shared_arrays['N'][root]
+            if current_count >= sims:
+                break
+            
+            delta = current_count - last_count
+            if delta > 0:
+                pbar.update(delta)
+                last_count = current_count
+            
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+    finally:
+        pbar.close()
+    
+    print("Stopping workers...")
+    stop_flag.value = 1
+    
+    for w in workers:
+        w.join(timeout=5)
+        if w.is_alive():
+            w.terminate()
+    
+    eval_proc.join(timeout=5)
+    if eval_proc.is_alive():
+        eval_proc.terminate()
+    
+    # Get best move
+    ptr = shared_arrays['CH_PTR'][root]
+    k = shared_arrays['CH_LEN'][root]
+    kids = [shared_arrays['CH_BUF'][ptr + i] for i in range(k)]
+    visits = [shared_arrays['N'][kid] for kid in kids]
+    best_idx = visits.index(max(visits))
+    best = kids[best_idx]
+    
+    print(f"\nTotal visits: {shared_arrays['N'][root]}")
+    print(f"Nodes created: {node_counter.value}")
+    
+    return best, visits, kids, board_mgr
 
 # ---------------- Example Usage ----------------
-board = chess.Board()
-root = alloc_node()
-BOARD_OBJ[root] = board
-BOARD[root] = board_to_tensor(board)
-CTX[root].zero_()
-TURN[root] = board.turn
-PRIOR[root] = 1.0
-
-model = ChessAttention().to(device).eval()
-best, visits, kids = run_mcts(root, model, sims=512)
-print("Best Move:", BOARD_OBJ[best])
+if __name__ == "__main__":
+    mp.set_start_method('spawn')
+    
+    board = chess.Board()
+    best, visits, kids, board_mgr = run_mcts_parallel(board, sims=200, num_workers=4)
+    
+    best_board = board_mgr[best]
+    print("Best Move:", best_board.peek())
+    print("Visits:", visits[:10])
