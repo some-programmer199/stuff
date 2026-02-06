@@ -67,12 +67,13 @@ N = W = Wanti = Q = antiQ = VAR = PRIOR = TURN = VLOSS = EXP = None
 PARENT = CH_PTR = CH_LEN = CH_BUF = QW_BUF = NODE_LOCKS = None
 CTX_RAW = BOARD_RAW = None
 board_manager = None
+CTX_VIEW = BOARD_VIEW = None
 
 def init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr):
     """Initialize arrays in worker process"""
     global N, W, Wanti, Q, antiQ, VAR, PRIOR, TURN, VLOSS, EXP
     global PARENT, CH_PTR, CH_LEN, CH_BUF, QW_BUF, NODE_LOCKS
-    global CTX_RAW, BOARD_RAW, board_manager
+    global CTX_RAW, BOARD_RAW, board_manager, CTX_VIEW, BOARD_VIEW
     
     N = shared_arrays['N']
     W = shared_arrays['W']
@@ -93,33 +94,30 @@ def init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr):
     CTX_RAW = ctx_raw
     BOARD_RAW = board_raw
     board_manager = board_mgr
+    CTX_VIEW = np.frombuffer(CTX_RAW, dtype=np.float32).reshape(MAX_NODES, CONTEXT_LENGTH)
+    BOARD_VIEW = np.frombuffer(BOARD_RAW, dtype=np.float32).reshape(MAX_NODES, MAX_PIECES, 4)
 
 # ---------------- Helper Functions ----------------
 def get_ctx(nid):
     """Get context for a node"""
-    start = nid * CONTEXT_LENGTH
-    return np.frombuffer(CTX_RAW, dtype=np.float32, count=CONTEXT_LENGTH, offset=start*4)
+    return CTX_VIEW[nid]
 
 def set_ctx(nid, ctx):
     """Set context for a node"""
-    start = nid * CONTEXT_LENGTH
-    arr = np.frombuffer(CTX_RAW, dtype=np.float32, count=CONTEXT_LENGTH, offset=start*4)
-    arr[:] = ctx
+    CTX_VIEW[nid] = ctx
 
 def get_board(nid):
     """Get board tensor for a node"""
-    start = nid * MAX_PIECES * 4
-    return np.frombuffer(BOARD_RAW, dtype=np.float32, count=MAX_PIECES*4, offset=start*4).reshape(MAX_PIECES, 4)
+    return BOARD_VIEW[nid]
 
 def set_board(nid, board_tensor):
     """Set board tensor for a node"""
-    start = nid * MAX_PIECES * 4
-    arr = np.frombuffer(BOARD_RAW, dtype=np.float32, count=MAX_PIECES*4, offset=start*4)
-    arr[:] = board_tensor.flatten()
+    BOARD_VIEW[nid] = board_tensor
 
 def board_to_tensor(board):
     tens = np.zeros((MAX_PIECES, 4), dtype=np.float32)
-    for i, (sq, pc) in enumerate(board.piece_map().items()):
+    piece_items = board.piece_map().items()
+    for i, (sq, pc) in enumerate(piece_items):
         if i >= MAX_PIECES - 1:
             break
         tens[i, 0] = pc.piece_type - 1
@@ -167,25 +165,29 @@ def select_path(root):
         # Safely get children
         kids = [CH_BUF[ptr + i] for i in range(k)]
         
-        # Calculate scores
-        scores = []
-        for kid in kids:
+        # Calculate scores and choose best in one pass
+        sqrt_parent = math.sqrt(N[nid] + 1)
+        best_score = -float("inf")
+        best_idx = 0
+        for i, kid in enumerate(kids):
             n = N[kid] + VLOSS[kid]
             w = W[kid] - VIRTUAL_LOSS * VLOSS[kid]
             q = w / max(n, 1)
             aq = Wanti[kid] / max(n, 1)
             
-            weight = QW_BUF[ptr + len(scores)]
+            weight = QW_BUF[ptr + i]
             value = q if TURN[kid] == TURN[nid] else aq
             exploit = weight * value
             
-            sqrt_parent = math.sqrt(N[nid] + 1)
             u = C_PUCT * PRIOR[kid] * sqrt_parent / (1 + n) * VAR[kid]
-            
-            scores.append(exploit + u)
-        
+
+            score = exploit + u
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
         # Select best child
-        idx = scores.index(max(scores))
+        idx = best_idx
         nid = kids[idx]
         VLOSS[nid] += 1
         path.append(nid)
@@ -236,20 +238,19 @@ def update_weights(nid, temp=1.0):
     if k <= 0:
         return
     
-    kids = [CH_BUF[ptr + i] for i in range(k)]
-    opp_values = []
-    
-    for kid in kids:
+    opp_values = np.empty(k, dtype=np.float32)
+
+    for i in range(k):
+        kid = CH_BUF[ptr + i]
         n = N[kid] + VLOSS[kid]
         w = W[kid] - VIRTUAL_LOSS * VLOSS[kid]
         q = w / max(n, 1)
         aq = Wanti[kid] / max(n, 1)
         
         opp_val = aq if TURN[kid] == TURN[nid] else q
-        opp_values.append(opp_val)
+        opp_values[i] = opp_val
     
     # Softmax
-    opp_values = np.array(opp_values)
     scaled = opp_values / (temp + 1e-12)
     exp_vals = np.exp(scaled - np.max(scaled))
     weights = exp_vals / np.sum(exp_vals)
@@ -355,8 +356,10 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                     boards_list = [get_board(nid) for nid in leaf_nodes]
                     ctxs_list = [get_ctx(nid) for nid in leaf_nodes]
                     
-                    boards_torch = torch.tensor(np.array(boards_list), dtype=torch.float32).to(device)
-                    ctxs_torch = torch.tensor(np.array(ctxs_list), dtype=torch.float32).to(device)
+                    boards_np = np.stack(boards_list, axis=0)
+                    ctxs_np = np.stack(ctxs_list, axis=0)
+                    boards_torch = torch.from_numpy(boards_np).to(device)
+                    ctxs_torch = torch.from_numpy(ctxs_np).to(device)
                     
                     # Evaluate
                     with torch.no_grad():
@@ -370,12 +373,16 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                         policy = {}
                         
                         if legal:
-                            idxs = [moves.pmove_to_idx.get(m.uci(), -1) for m in legal]
+                            idxs = torch.tensor(
+                                [moves.pmove_to_idx.get(m.uci(), -1) for m in legal],
+                                dtype=torch.long,
+                                device=device,
+                            )
+                            valid = (idxs >= 0) & (idxs < logits.size(1))
                             l = torch.full((len(legal),), -1e9, device=device)
-                            for j, idx in enumerate(idxs):
-                                if 0 <= idx < logits.size(1):
-                                    l[j] = logits[i, idx]
-                            probs = torch.softmax(l / TEMPERATURE, 0)
+                            if torch.any(valid):
+                                l[valid] = logits[i, idxs[valid]]
+                            probs = torch.softmax(l / TEMPERATURE, dim=0)
                             policy = {m.uci(): float(p) for m, p in zip(legal, probs)}
                         
                         results.append((
