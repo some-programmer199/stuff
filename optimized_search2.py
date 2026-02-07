@@ -20,6 +20,8 @@ VIRTUAL_LOSS = 3.0
 TEMPERATURE = 2.5
 NUM_WORKERS = 4  # Start with fewer workers
 BATCH_SIZE = 16  # Smaller batch size to start
+DIRICHLET_ALPHA = 0.3
+NOISE_EPS = 0.25
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -173,6 +175,16 @@ def summarize_profile(label, timings, count):
     avg_ms = (total / count * 1000.0) if count > 0 else 0.0
     print(f"{label} profile: steps={count}, total={total:.3f}s, avg={avg_ms:.2f}ms, {detail}")
 
+def add_dirichlet_noise(policy, rng, eps=NOISE_EPS, alpha=DIRICHLET_ALPHA):
+    if not policy:
+        return policy
+    moves_list = list(policy.keys())
+    noise = rng.dirichlet([alpha] * len(moves_list))
+    mixed = {}
+    for mv, n in zip(moves_list, noise):
+        mixed[mv] = (1 - eps) * policy[mv] + eps * float(n)
+    return mixed
+
 # ---------------- Tree Operations ----------------
 def select_path(root):
     path = [root]
@@ -309,6 +321,7 @@ def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
     try:
         init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
         print(f"Worker {worker_id} started")
+        rng = np.random.default_rng(worker_id + int(time.time()))
         timings = {
             "select": 0.0,
             "enqueue": 0.0,
@@ -341,6 +354,7 @@ def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
                     break
                 
                 nid, policy, v, av, var, new_ctx = result
+                policy = add_dirichlet_noise(policy, rng)
                 set_ctx(nid, new_ctx)
                 t0 = time.perf_counter()
                 expand(nid, policy, new_ctx, var, node_counter, node_lock, child_counter, child_lock)
