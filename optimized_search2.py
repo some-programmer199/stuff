@@ -2,7 +2,7 @@ import torch
 import chess
 import math
 import numpy as np
-from optimized_model import ChessAttention
+from optimized_model import ChessAttention, HISTORY_LEN, HISTORY_PAD_IDX
 import moves
 import tqdm
 import multiprocessing as mp
@@ -127,6 +127,14 @@ def board_to_tensor(board):
     tens[MAX_PIECES - 1, 0] = 10.0
     tens[MAX_PIECES - 1, 1] = float(board.ply())
     return tens
+
+def board_to_history(board):
+    history = np.full(HISTORY_LEN, HISTORY_PAD_IDX, dtype=np.int64)
+    move_stack = list(board.move_stack)[-HISTORY_LEN:]
+    start = HISTORY_LEN - len(move_stack)
+    for i, mv in enumerate(move_stack):
+        history[start + i] = moves.pmove_to_idx.get(mv.uci(), HISTORY_PAD_IDX)
+    return history
 
 def alloc_node(node_counter, node_lock):
     with node_lock:
@@ -398,18 +406,23 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                     # Get tensors
                     t0 = time.perf_counter()
                     boards_list = [get_board(nid) for nid in leaf_nodes]
-                    ctxs_list = [get_ctx(nid) for nid in leaf_nodes]
+                    history_list = [board_to_history(board_mgr[nid]) for nid in leaf_nodes]
                     
                     boards_np = np.stack(boards_list, axis=0)
-                    ctxs_np = np.stack(ctxs_list, axis=0)
+                    history_np = np.stack(history_list, axis=0)
                     boards_torch = torch.from_numpy(boards_np).to(device)
-                    ctxs_torch = torch.from_numpy(ctxs_np).to(device)
+                    history_torch = torch.from_numpy(history_np).to(device)
+                    history_mask = history_torch.eq(HISTORY_PAD_IDX)
                     timings["tensor"] += time.perf_counter() - t0
                     
                     # Evaluate
                     t0 = time.perf_counter()
                     with torch.no_grad():
-                        v, av, var, logits, new_ctxs = model(boards_torch, ctxs_torch)
+                        v, av, var, logits, new_ctxs = model(
+                            boards_torch,
+                            history_torch,
+                            history_mask
+                        )
                     timings["model"] += time.perf_counter() - t0
                     
                     # Process results
