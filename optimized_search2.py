@@ -153,6 +153,18 @@ def acquire_node(nid):
 def release_node(nid):
     NODE_LOCKS[nid] = 0
 
+def summarize_profile(label, timings, count):
+    if count <= 0:
+        return
+    total = sum(timings.values())
+    parts = []
+    for key, value in timings.items():
+        pct = (value / total * 100.0) if total > 0 else 0.0
+        parts.append(f"{key}={value:.3f}s ({pct:.1f}%)")
+    detail = ", ".join(parts)
+    avg_ms = (total / count * 1000.0) if count > 0 else 0.0
+    print(f"{label} profile: steps={count}, total={total:.3f}s, avg={avg_ms:.2f}ms, {detail}")
+
 # ---------------- Tree Operations ----------------
 def select_path(root):
     path = [root]
@@ -289,32 +301,53 @@ def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
     try:
         init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
         print(f"Worker {worker_id} started")
+        timings = {
+            "select": 0.0,
+            "enqueue": 0.0,
+            "wait_result": 0.0,
+            "expand": 0.0,
+            "backup": 0.0,
+        }
+        iterations = 0
         
         while not stop_flag.value:
             try:
+                t0 = time.perf_counter()
                 leaf, path = select_path(root_node)
+                timings["select"] += time.perf_counter() - t0
                 
                 if EXP[leaf]:
                     for nid in path:
                         VLOSS[nid] = max(0, VLOSS[nid] - 1)
                     continue
                 
+                t0 = time.perf_counter()
                 eval_queue.put((worker_id, leaf, path))
+                timings["enqueue"] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
                 result = result_queue.get(timeout=10)
+                timings["wait_result"] += time.perf_counter() - t0
                 
                 if result is None:
                     break
                 
                 nid, policy, v, av, var, new_ctx = result
                 set_ctx(nid, new_ctx)
+                t0 = time.perf_counter()
                 expand(nid, policy, new_ctx, var, node_counter, node_lock, child_counter, child_lock)
+                timings["expand"] += time.perf_counter() - t0
+                t0 = time.perf_counter()
                 backup(path, nid, v, av, var)
+                timings["backup"] += time.perf_counter() - t0
+                iterations += 1
                 
             except Exception as e:
                 print(f"Worker {worker_id} iteration error: {e}")
                 continue
         
         print(f"Worker {worker_id} stopped")
+        summarize_profile(f"Worker {worker_id}", timings, iterations)
     except Exception as e:
         print(f"Worker {worker_id} fatal error: {e}")
         import traceback
@@ -331,13 +364,23 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
         print(f"Model loaded on {device}")
         
         pending_evals = []
+        timings = {
+            "collect": 0.0,
+            "tensor": 0.0,
+            "model": 0.0,
+            "policy": 0.0,
+            "send": 0.0,
+        }
+        batches = 0
         
         while not stop_flag.value or not eval_queue.empty():
             try:
                 # Collect batch
                 timeout = 0.01 if pending_evals else 0.1
                 try:
+                    t0 = time.perf_counter()
                     item = eval_queue.get(timeout=timeout)
+                    timings["collect"] += time.perf_counter() - t0
                     if item is None:
                         break
                     pending_evals.append(item)
@@ -353,6 +396,7 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                     leaf_nodes = [item[1] for item in batch]
                     
                     # Get tensors
+                    t0 = time.perf_counter()
                     boards_list = [get_board(nid) for nid in leaf_nodes]
                     ctxs_list = [get_ctx(nid) for nid in leaf_nodes]
                     
@@ -360,12 +404,16 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                     ctxs_np = np.stack(ctxs_list, axis=0)
                     boards_torch = torch.from_numpy(boards_np).to(device)
                     ctxs_torch = torch.from_numpy(ctxs_np).to(device)
+                    timings["tensor"] += time.perf_counter() - t0
                     
                     # Evaluate
+                    t0 = time.perf_counter()
                     with torch.no_grad():
                         v, av, var, logits, new_ctxs = model(boards_torch, ctxs_torch)
+                    timings["model"] += time.perf_counter() - t0
                     
                     # Process results
+                    t0 = time.perf_counter()
                     results = []
                     for i, nid in enumerate(leaf_nodes):
                         board = board_mgr[nid]
@@ -393,10 +441,14 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                             float(var[i]),
                             new_ctxs[i].cpu().numpy()
                         ))
+                    timings["policy"] += time.perf_counter() - t0
                     
                     # Send results
+                    t0 = time.perf_counter()
                     for (worker_id, _, _), result in zip(batch, results):
                         result_queues[worker_id].put(result)
+                    timings["send"] += time.perf_counter() - t0
+                    batches += 1
                         
             except Exception as e:
                 print(f"Eval worker batch error: {e}")
@@ -407,6 +459,7 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
             q.put(None)
         
         print("Evaluation worker stopped")
+        summarize_profile("Eval worker", timings, batches)
     except Exception as e:
         print(f"Eval worker fatal error: {e}")
         import traceback
@@ -466,8 +519,10 @@ def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS):
         workers.append(p)
     
     print(f"Running {sims} simulations...")
-    pbar = tqdm.tqdm(total=sims)
+    pbar = tqdm.tqdm(total=sims, desc="Simulations", position=0)
+    node_bar = tqdm.tqdm(total=MAX_NODES, desc="Nodes created", position=1, leave=False)
     last_count = 0
+    last_nodes = node_counter.value
     
     try:
         while True:
@@ -479,12 +534,19 @@ def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS):
             if delta > 0:
                 pbar.update(delta)
                 last_count = current_count
+
+            current_nodes = node_counter.value
+            delta_nodes = current_nodes - last_nodes
+            if delta_nodes > 0:
+                node_bar.update(delta_nodes)
+                last_nodes = current_nodes
             
             time.sleep(0.1)
     except KeyboardInterrupt:
         print("\nInterrupted")
     finally:
         pbar.close()
+        node_bar.close()
     
     print("Stopping workers...")
     stop_flag.value = 1
