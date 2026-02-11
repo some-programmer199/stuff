@@ -317,7 +317,7 @@ def backup(path, leaf, v, av, var):
 # ---------------- Search Worker ----------------
 def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
                   node_counter, node_lock, child_counter, child_lock,
-                  eval_queue, result_queue, stop_flag, root_node):
+                  eval_queue, result_queue, stop_flag, root_node, eps=NOISE_EPS, alpha=DIRICHLET_ALPHA, use_anti=True):
     try:
         init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
         print(f"Worker {worker_id} started")
@@ -354,7 +354,7 @@ def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
                     break
                 
                 nid, policy, v, av, var, new_ctx = result
-                policy = add_dirichlet_noise(policy, rng)
+                policy = add_dirichlet_noise(policy, rng, eps=eps, alpha=alpha)
                 set_ctx(nid, new_ctx)
                 t0 = time.perf_counter()
                 expand(nid, policy, new_ctx, var, node_counter, node_lock, child_counter, child_lock)
@@ -493,7 +493,7 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
         traceback.print_exc()
 
 # ---------------- Main MCTS ----------------
-def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS):
+def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, alpha=DIRICHLET_ALPHA, use_anti=True):
     print("Initializing shared memory...")
     shared_arrays = create_shared_arrays()
     ctx_raw, board_raw = create_shared_tensors()
@@ -540,7 +540,7 @@ def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS):
             target=search_worker,
             args=(i, shared_arrays, ctx_raw, board_raw, board_mgr,
                   node_counter, node_lock, child_counter, child_lock,
-                  eval_queue, result_queues[i], stop_flag, root)
+                  eval_queue, result_queues[i], stop_flag, root, eps, alpha, use_anti)
         )
         p.start()
         workers.append(p)
