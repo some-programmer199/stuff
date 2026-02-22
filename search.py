@@ -11,6 +11,11 @@ import ctypes
 import time
 import os
 
+try:
+    import torch_xla.core.xla_model as xm
+except ImportError:
+    xm = None
+
 # ---------------- Config ----------------
 MAX_NODES = 500_000
 CONTEXT_LENGTH = 2688
@@ -23,7 +28,28 @@ BATCH_SIZE = 16  # Smaller batch size to start
 DIRICHLET_ALPHA = 0.3
 NOISE_EPS = 0.25
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def resolve_device(device_type="gpu"):
+    """Resolve runtime device from config: cpu, gpu, or tpu."""
+    normalized = (device_type or "gpu").strip().lower()
+
+    if normalized == "cpu":
+        return torch.device("cpu")
+
+    if normalized == "tpu":
+        if xm is None:
+            raise RuntimeError("TPU device requested but torch_xla is not installed")
+        return xm.xla_device()
+
+    if normalized == "gpu":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+
+    raise ValueError(f"Unsupported device type: {device_type}. Use cpu, gpu, or tpu.")
+
+
+DEFAULT_DEVICE_TYPE = "gpu"
+device = resolve_device(DEFAULT_DEVICE_TYPE)
 
 # ---------------- Shared Arrays using multiprocessing.Array ----------------
 def create_shared_arrays():
@@ -377,13 +403,15 @@ def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
 
 # ---------------- Evaluation Worker ----------------
 def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
-                      eval_queue, result_queues, stop_flag, batch_size=BATCH_SIZE):
+                      eval_queue, result_queues, stop_flag, batch_size=BATCH_SIZE, device_type=DEFAULT_DEVICE_TYPE):
     try:
         init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
         
         print("Loading model...")
-        model = ChessAttention().to(device).eval()
-        print(f"Model loaded on {device}")
+        eval_device = resolve_device(device_type)
+        model = ChessAttention().to(eval_device).eval()
+        runtime = "TPU/XLA" if str(eval_device).startswith("xla") else str(eval_device)
+        print(f"Model loaded on {runtime}")
         
         pending_evals = []
         timings = {
@@ -424,8 +452,8 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                     
                     boards_np = np.stack(boards_list, axis=0)
                     history_np = np.stack(history_list, axis=0)
-                    boards_torch = torch.from_numpy(boards_np).to(device)
-                    history_torch = torch.from_numpy(history_np).to(device)
+                    boards_torch = torch.from_numpy(boards_np).to(eval_device)
+                    history_torch = torch.from_numpy(history_np).to(eval_device)
                     history_mask = history_torch.eq(HISTORY_PAD_IDX)
                     timings["tensor"] += time.perf_counter() - t0
                     
@@ -437,6 +465,8 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                             history_torch,
                             history_mask
                         )
+                        if xm is not None and str(eval_device).startswith("xla"):
+                            xm.mark_step()
                     timings["model"] += time.perf_counter() - t0
                     
                     # Process results
@@ -451,10 +481,10 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
                             idxs = torch.tensor(
                                 [moves.pmove_to_idx.get(m.uci(), -1) for m in legal],
                                 dtype=torch.long,
-                                device=device,
+                                device=eval_device,
                             )
                             valid = (idxs >= 0) & (idxs < logits.size(1))
-                            l = torch.full((len(legal),), -1e9, device=device)
+                            l = torch.full((len(legal),), -1e9, device=eval_device)
                             if torch.any(valid):
                                 l[valid] = logits[i, idxs[valid]]
                             probs = torch.softmax(l / TEMPERATURE, dim=0)
@@ -493,7 +523,7 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
         traceback.print_exc()
 
 # ---------------- Main MCTS ----------------
-def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, alpha=DIRICHLET_ALPHA, use_anti=True):
+def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, alpha=DIRICHLET_ALPHA, use_anti=True, device_type=DEFAULT_DEVICE_TYPE):
     print("Initializing shared memory...")
     shared_arrays = create_shared_arrays()
     ctx_raw, board_raw = create_shared_tensors()
@@ -527,7 +557,7 @@ def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, a
     print("Starting evaluation worker...")
     eval_proc = Process(
         target=evaluation_worker,
-        args=(shared_arrays, ctx_raw, board_raw, board_mgr, eval_queue, result_queues, stop_flag)
+        args=(shared_arrays, ctx_raw, board_raw, board_mgr, eval_queue, result_queues, stop_flag, BATCH_SIZE, device_type)
     )
     eval_proc.start()
     
