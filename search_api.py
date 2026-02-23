@@ -1,5 +1,6 @@
 import chess
 import search
+import search_tpu
 
 
 class SearchConfig:
@@ -17,12 +18,18 @@ class SearchConfig:
 
 
 class GameBot:
-    def __init__(self, config: SearchConfig, search_function=search.run_mcts_parallel):
-        self.search_function = search_function
+    def __init__(self, config: SearchConfig, device=None):
         self.config = config
+        selected = (device if device is not None else config.device).strip().lower()
+        if selected == "tpu":
+            self.search_function = search_tpu.run_mcts_parallel
+        elif selected in ("gpu", "cpu"):
+            self.search_function = search.run_mcts_parallel
+        else:
+            raise ValueError(f"Unsupported device: {selected}. Use cpu, gpu, or tpu.")
 
     def get_move(self):
-        board, num_sims, num_workers, eps, alpha, use_anti, device = self.config.config()
+        board, num_sims, num_workers, eps, alpha, use_anti, _ = self.config.config()
         move = self.search_function(
             board,
             sims=num_sims,
@@ -30,7 +37,6 @@ class GameBot:
             eps=eps,
             alpha=alpha,
             use_anti=use_anti,
-            device_type=device,
         )
         return move
 
