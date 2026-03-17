@@ -10,6 +10,7 @@ from multiprocessing import Queue, Process, Value, Array, Manager
 import ctypes
 import time
 import os
+from queue import Empty, Full
 
 # ---------------- Config ----------------
 MAX_NODES = 500_000
@@ -26,42 +27,42 @@ NOISE_EPS = 0.25
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------- Shared Arrays using multiprocessing.Array ----------------
-def create_shared_arrays():
-    """Create shared arrays using multiprocessing.Array (more reliable than shared_memory)"""
+def create_shared_arrays(max_nodes):
+    """Create shared arrays using multiprocessing.Array (more reliable than shared_memory)."""
     arrays = {
-        'N': Array(ctypes.c_int32, MAX_NODES, lock=False),
-        'W': Array(ctypes.c_float, MAX_NODES, lock=False),
-        'Wanti': Array(ctypes.c_float, MAX_NODES, lock=False),
-        'Q': Array(ctypes.c_float, MAX_NODES, lock=False),
-        'antiQ': Array(ctypes.c_float, MAX_NODES, lock=False),
-        'VAR': Array(ctypes.c_float, MAX_NODES, lock=False),
-        'PRIOR': Array(ctypes.c_float, MAX_NODES, lock=False),
-        'TURN': Array(ctypes.c_bool, MAX_NODES, lock=False),
-        'VLOSS': Array(ctypes.c_int16, MAX_NODES, lock=False),
-        'EXP': Array(ctypes.c_bool, MAX_NODES, lock=False),
-        'PARENT': Array(ctypes.c_int32, MAX_NODES, lock=False),
-        'CH_PTR': Array(ctypes.c_int32, MAX_NODES, lock=False),
-        'CH_LEN': Array(ctypes.c_int16, MAX_NODES, lock=False),
-        'CH_BUF': Array(ctypes.c_int32, MAX_NODES * 8, lock=False),
-        'QW_BUF': Array(ctypes.c_float, MAX_NODES * 8, lock=False),
-        'NODE_LOCKS': Array(ctypes.c_uint8, MAX_NODES, lock=False),
+        'N': Array(ctypes.c_int32, max_nodes, lock=False),
+        'W': Array(ctypes.c_float, max_nodes, lock=False),
+        'Wanti': Array(ctypes.c_float, max_nodes, lock=False),
+        'Q': Array(ctypes.c_float, max_nodes, lock=False),
+        'antiQ': Array(ctypes.c_float, max_nodes, lock=False),
+        'VAR': Array(ctypes.c_float, max_nodes, lock=False),
+        'PRIOR': Array(ctypes.c_float, max_nodes, lock=False),
+        'TURN': Array(ctypes.c_bool, max_nodes, lock=False),
+        'VLOSS': Array(ctypes.c_int16, max_nodes, lock=False),
+        'EXP': Array(ctypes.c_bool, max_nodes, lock=False),
+        'PARENT': Array(ctypes.c_int32, max_nodes, lock=False),
+        'CH_PTR': Array(ctypes.c_int32, max_nodes, lock=False),
+        'CH_LEN': Array(ctypes.c_int16, max_nodes, lock=False),
+        'CH_BUF': Array(ctypes.c_int32, max_nodes * 8, lock=False),
+        'QW_BUF': Array(ctypes.c_float, max_nodes * 8, lock=False),
+        'NODE_LOCKS': Array(ctypes.c_uint8, max_nodes, lock=False),
     }
     
     # Initialize
-    for i in range(MAX_NODES):
+    for i in range(max_nodes):
         arrays['VAR'][i] = 1.0
         arrays['PARENT'][i] = -1
     
-    for i in range(MAX_NODES * 8):
+    for i in range(max_nodes * 8):
         arrays['CH_BUF'][i] = -1
     
     return arrays
 
-def create_shared_tensors():
+def create_shared_tensors(max_nodes):
     """Create large tensor arrays separately"""
     # Use RawArray for large tensors (no locking overhead)
-    ctx_array = mp.RawArray(ctypes.c_float, MAX_NODES * CONTEXT_LENGTH)
-    board_array = mp.RawArray(ctypes.c_float, MAX_NODES * MAX_PIECES * 4)
+    ctx_array = mp.RawArray(ctypes.c_float, max_nodes * CONTEXT_LENGTH)
+    board_array = mp.RawArray(ctypes.c_float, max_nodes * MAX_PIECES * 4)
     return ctx_array, board_array
 
 # ---------------- Worker Globals ----------------
@@ -70,12 +71,13 @@ PARENT = CH_PTR = CH_LEN = CH_BUF = QW_BUF = NODE_LOCKS = None
 CTX_RAW = BOARD_RAW = None
 board_manager = None
 CTX_VIEW = BOARD_VIEW = None
+NODE_CAP = MAX_NODES
 
-def init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr):
+def init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr, node_cap):
     """Initialize arrays in worker process"""
     global N, W, Wanti, Q, antiQ, VAR, PRIOR, TURN, VLOSS, EXP
     global PARENT, CH_PTR, CH_LEN, CH_BUF, QW_BUF, NODE_LOCKS
-    global CTX_RAW, BOARD_RAW, board_manager, CTX_VIEW, BOARD_VIEW
+    global CTX_RAW, BOARD_RAW, board_manager, CTX_VIEW, BOARD_VIEW, NODE_CAP
     
     N = shared_arrays['N']
     W = shared_arrays['W']
@@ -96,8 +98,9 @@ def init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr):
     CTX_RAW = ctx_raw
     BOARD_RAW = board_raw
     board_manager = board_mgr
-    CTX_VIEW = np.frombuffer(CTX_RAW, dtype=np.float32).reshape(MAX_NODES, CONTEXT_LENGTH)
-    BOARD_VIEW = np.frombuffer(BOARD_RAW, dtype=np.float32).reshape(MAX_NODES, MAX_PIECES, 4)
+    NODE_CAP = node_cap
+    CTX_VIEW = np.frombuffer(CTX_RAW, dtype=np.float32).reshape(node_cap, CONTEXT_LENGTH)
+    BOARD_VIEW = np.frombuffer(BOARD_RAW, dtype=np.float32).reshape(node_cap, MAX_PIECES, 4)
 
 # ---------------- Helper Functions ----------------
 def get_ctx(nid):
@@ -141,12 +144,16 @@ def board_to_history(board):
 def alloc_node(node_counter, node_lock):
     with node_lock:
         nid = node_counter.value
+        if nid >= NODE_CAP:
+            raise RuntimeError(f"Node capacity exceeded ({NODE_CAP}); increase sims or capacity heuristic")
         node_counter.value += 1
         return nid
 
 def alloc_children(k, child_counter, child_lock):
     with child_lock:
         ptr = child_counter.value
+        if ptr + k > NODE_CAP * 8:
+            raise RuntimeError(f"Child buffer capacity exceeded ({NODE_CAP * 8}); increase sims or capacity heuristic")
         child_counter.value += k
         return ptr
 
@@ -194,33 +201,29 @@ def select_path(root):
         ptr = CH_PTR[nid]
         k = CH_LEN[nid]
         
-        # Safely get children
-        kids = [CH_BUF[ptr + i] for i in range(k)]
-        
-        # Calculate scores and choose best in one pass
-        sqrt_parent = math.sqrt(N[nid] + 1)
-        best_score = -float("inf")
-        best_idx = 0
-        for i, kid in enumerate(kids):
-            n = N[kid] + VLOSS[kid]
-            w = W[kid] - VIRTUAL_LOSS * VLOSS[kid]
-            q = w / max(n, 1)
-            aq = Wanti[kid] / max(n, 1)
-            
-            weight = QW_BUF[ptr + i]
-            value = q if TURN[kid] == TURN[nid] else aq
-            exploit = weight * value
-            
-            u = C_PUCT * PRIOR[kid] * sqrt_parent / (1 + n) * VAR[kid]
+        # Vectorized child selection with NumPy.
+        kids = np.fromiter((CH_BUF[ptr + i] for i in range(k)), dtype=np.int32, count=k)
 
-            score = exploit + u
-            if score > best_score:
-                best_score = score
-                best_idx = i
+        sqrt_parent = math.sqrt(N[nid] + 1)
+        n = np.fromiter((N[kid] + VLOSS[kid] for kid in kids), dtype=np.float32, count=k)
+        w = np.fromiter((W[kid] - VIRTUAL_LOSS * VLOSS[kid] for kid in kids), dtype=np.float32, count=k)
+        aq_w = np.fromiter((Wanti[kid] for kid in kids), dtype=np.float32, count=k)
+        prior = np.fromiter((PRIOR[kid] for kid in kids), dtype=np.float32, count=k)
+        child_var = np.fromiter((VAR[kid] for kid in kids), dtype=np.float32, count=k)
+        child_turns = np.fromiter((TURN[kid] for kid in kids), dtype=np.bool_, count=k)
+        weights = np.fromiter((QW_BUF[ptr + i] for i in range(k)), dtype=np.float32, count=k)
+
+        denom = np.maximum(n, 1.0)
+        q = w / denom
+        aq = aq_w / denom
+        values = np.where(child_turns == TURN[nid], q, aq)
+        exploit = weights * values
+        explore = C_PUCT * prior * sqrt_parent / (1.0 + n) * child_var
+        best_idx = int(np.argmax(exploit + explore))
 
         # Select best child
         idx = best_idx
-        nid = kids[idx]
+        nid = int(kids[idx])
         VLOSS[nid] += 1
         path.append(nid)
     
@@ -317,55 +320,110 @@ def backup(path, leaf, v, av, var):
 # ---------------- Search Worker ----------------
 def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
                   node_counter, node_lock, child_counter, child_lock,
-                  eval_queue, result_queue, stop_flag, root_node, eps=NOISE_EPS, alpha=DIRICHLET_ALPHA, use_anti=True):
+                  eval_queue, result_queue, stop_flag, root_node, node_cap,
+                  sim_counter, sim_lock, sim_limit,
+                  eps=NOISE_EPS, alpha=DIRICHLET_ALPHA, use_anti=True):
     try:
-        init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
+        init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr, node_cap)
         print(f"Worker {worker_id} started")
         rng = np.random.default_rng(worker_id + int(time.time()))
         timings = {
             "select": 0.0,
             "enqueue": 0.0,
-            "wait_result": 0.0,
+            "results": 0.0,
             "expand": 0.0,
             "backup": 0.0,
         }
         iterations = 0
+        pending_paths = {}
+        max_inflight = 4
         
         while not stop_flag.value:
             try:
                 t0 = time.perf_counter()
+                while True:
+                    try:
+                        result = result_queue.get_nowait()
+                    except Empty:
+                        break
+
+                    if result is None:
+                        stop_flag.value = 1
+                        break
+
+                    nid, policy, v, av, var, new_ctx = result
+                    paths = pending_paths.get(nid)
+                    if not paths:
+                        continue
+                    path = paths.pop()
+                    if not paths:
+                        pending_paths.pop(nid, None)
+
+                    policy = add_dirichlet_noise(policy, rng, eps=eps, alpha=alpha)
+                    set_ctx(nid, new_ctx)
+                    t_expand = time.perf_counter()
+                    expand(nid, policy, new_ctx, var, node_counter, node_lock, child_counter, child_lock)
+                    timings["expand"] += time.perf_counter() - t_expand
+                    t_backup = time.perf_counter()
+                    backup(path, nid, v, av, var)
+                    timings["backup"] += time.perf_counter() - t_backup
+                    iterations += 1
+                timings["results"] += time.perf_counter() - t0
+
+                if stop_flag.value:
+                    break
+
+                if len(pending_paths) >= max_inflight:
+                    time.sleep(0.001)
+                    continue
+
+                with sim_lock:
+                    if sim_counter.value >= sim_limit:
+                        reserve_slot = False
+                    else:
+                        sim_counter.value += 1
+                        reserve_slot = True
+
+                if not reserve_slot:
+                    if not pending_paths:
+                        break
+                    time.sleep(0.001)
+                    continue
+
+                t0 = time.perf_counter()
                 leaf, path = select_path(root_node)
                 timings["select"] += time.perf_counter() - t0
-                
+
                 if EXP[leaf]:
                     for nid in path:
                         VLOSS[nid] = max(0, VLOSS[nid] - 1)
+                    with sim_lock:
+                        sim_counter.value = max(0, sim_counter.value - 1)
                     continue
-                
-                t0 = time.perf_counter()
-                eval_queue.put((worker_id, leaf, path))
-                timings["enqueue"] += time.perf_counter() - t0
 
-                t0 = time.perf_counter()
-                result = result_queue.get(timeout=10)
-                timings["wait_result"] += time.perf_counter() - t0
-                
-                if result is None:
-                    break
-                
-                nid, policy, v, av, var, new_ctx = result
-                policy = add_dirichlet_noise(policy, rng, eps=eps, alpha=alpha)
-                set_ctx(nid, new_ctx)
-                t0 = time.perf_counter()
-                expand(nid, policy, new_ctx, var, node_counter, node_lock, child_counter, child_lock)
-                timings["expand"] += time.perf_counter() - t0
-                t0 = time.perf_counter()
-                backup(path, nid, v, av, var)
-                timings["backup"] += time.perf_counter() - t0
-                iterations += 1
+                try:
+                    t0 = time.perf_counter()
+                    eval_queue.put((worker_id, leaf, path), timeout=0.01)
+                    timings["enqueue"] += time.perf_counter() - t0
+                    pending_paths.setdefault(leaf, []).append(path)
+                except Full:
+                    for nid in path:
+                        VLOSS[nid] = max(0, VLOSS[nid] - 1)
+                    with sim_lock:
+                        sim_counter.value = max(0, sim_counter.value - 1)
+                    continue
+                except Exception:
+                    for nid in path:
+                        VLOSS[nid] = max(0, VLOSS[nid] - 1)
+                    with sim_lock:
+                        sim_counter.value = max(0, sim_counter.value - 1)
+                    raise
                 
             except Exception as e:
                 print(f"Worker {worker_id} iteration error: {e}")
+                if "capacity exceeded" in str(e).lower():
+                    stop_flag.value = 1
+                    break
                 continue
         
         print(f"Worker {worker_id} stopped")
@@ -377,9 +435,9 @@ def search_worker(worker_id, shared_arrays, ctx_raw, board_raw, board_mgr,
 
 # ---------------- Evaluation Worker ----------------
 def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
-                      eval_queue, result_queues, stop_flag, batch_size=BATCH_SIZE):
+                      eval_queue, result_queues, stop_flag, node_cap, batch_size=BATCH_SIZE):
     try:
-        init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr)
+        init_worker_arrays(shared_arrays, ctx_raw, board_raw, board_mgr, node_cap)
         
         print("Loading model...")
         model = ChessAttention().to(device).eval()
@@ -495,8 +553,9 @@ def evaluation_worker(shared_arrays, ctx_raw, board_raw, board_mgr,
 # ---------------- Main MCTS ----------------
 def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, alpha=DIRICHLET_ALPHA, use_anti=True):
     print("Initializing shared memory...")
-    shared_arrays = create_shared_arrays()
-    ctx_raw, board_raw = create_shared_tensors()
+    max_nodes = min(MAX_NODES, max(4096, int(sims) * 32))
+    shared_arrays = create_shared_arrays(max_nodes)
+    ctx_raw, board_raw = create_shared_tensors(max_nodes)
     
     print("Initializing board manager...")
     manager = Manager()
@@ -506,14 +565,16 @@ def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, a
     node_lock = mp.Lock()
     child_counter = Value('i', 0)
     child_lock = mp.Lock()
+    sim_counter = Value('i', 0)
+    sim_lock = mp.Lock()
     
     # Initialize root
     root = 0
     board_mgr[root] = board
     
     # Access raw arrays through numpy
-    board_arr = np.frombuffer(board_raw, dtype=np.float32).reshape(MAX_NODES, MAX_PIECES, 4)
-    ctx_arr = np.frombuffer(ctx_raw, dtype=np.float32).reshape(MAX_NODES, CONTEXT_LENGTH)
+    board_arr = np.frombuffer(board_raw, dtype=np.float32).reshape(max_nodes, MAX_PIECES, 4)
+    ctx_arr = np.frombuffer(ctx_raw, dtype=np.float32).reshape(max_nodes, CONTEXT_LENGTH)
     
     board_arr[root] = board_to_tensor(board)
     ctx_arr[root] = 0
@@ -527,7 +588,7 @@ def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, a
     print("Starting evaluation worker...")
     eval_proc = Process(
         target=evaluation_worker,
-        args=(shared_arrays, ctx_raw, board_raw, board_mgr, eval_queue, result_queues, stop_flag)
+        args=(shared_arrays, ctx_raw, board_raw, board_mgr, eval_queue, result_queues, stop_flag, max_nodes)
     )
     eval_proc.start()
     
@@ -540,14 +601,15 @@ def run_mcts_parallel(board, sims=800, num_workers=NUM_WORKERS, eps=NOISE_EPS, a
             target=search_worker,
             args=(i, shared_arrays, ctx_raw, board_raw, board_mgr,
                   node_counter, node_lock, child_counter, child_lock,
-                  eval_queue, result_queues[i], stop_flag, root, eps, alpha, use_anti)
+                  eval_queue, result_queues[i], stop_flag, root, max_nodes,
+                  sim_counter, sim_lock, sims, eps, alpha, use_anti)
         )
         p.start()
         workers.append(p)
     
     print(f"Running {sims} simulations...")
     pbar = tqdm.tqdm(total=sims, desc="Simulations", position=0)
-    node_bar = tqdm.tqdm(total=MAX_NODES, desc="Nodes created", position=1, leave=False)
+    node_bar = tqdm.tqdm(total=max_nodes, desc="Nodes created", position=1, leave=False)
     last_count = 0
     last_nodes = node_counter.value
     
